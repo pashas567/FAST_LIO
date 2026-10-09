@@ -91,6 +91,24 @@ public:
 			<< group.lidar_beg_time << ',' << group.lidar_end_time << ','
 			<< group.lidar->size() << ',' << group.imu.size();
 		Event(line.str());
+		const auto cloud_identity = identities_.find(group.lidar.get());
+		uint64_t hash = 14695981039346656037ull;
+		for (const auto& point : group.lidar->points)
+		{
+			const float values[] = {point.x, point.y, point.z, point.intensity, point.curvature};
+			for (const float value : values)
+			{
+				const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+				for (size_t byte = 0; byte < sizeof(value); ++byte)
+				{
+					hash ^= bytes[byte];
+					hash *= 1099511628211ull;
+				}
+			}
+		}
+		Event("cloud," + std::to_string(group_) + ","
+			+ std::to_string(cloud_identity == identities_.end() ? 0 : cloud_identity->second)
+			+ "," + std::to_string(hash));
 		for (size_t index = 0; index < group.imu.size(); ++index)
 		{
 			const auto& imu = group.imu[index];
@@ -106,6 +124,14 @@ public:
 	uint64_t GroupId() const
 	{
 		return group_;
+	}
+
+	void Identify(const void* identity, uint64_t sequence)
+	{
+		if (Active() && identity && sequence != 0)
+		{
+			identities_[identity] = sequence;
+		}
 	}
 
 	void Save()

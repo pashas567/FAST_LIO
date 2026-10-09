@@ -61,6 +61,7 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
+#include "group_replay.hpp"
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
@@ -379,7 +380,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
-	StartupTrace::Get().Input(2, *msg);
+	const uint64_t cloud_sequence = StartupTrace::Get().Input(2, *msg);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -409,6 +410,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
+	StartupTrace::Get().Identify(ptr.get(), cloud_sequence);
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -877,6 +879,8 @@ class LaserMappingNode : public rclcpp::Node
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
+        this->declare_parameter<std::string>("startup.replay_file", "");
+        this->declare_parameter<bool>("startup.replay_check_point_count", true);
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -1034,11 +1038,36 @@ public:
 		StartupTrace::Get().Save();
     }
 
+public:
+	bool ReplayIfRequested()
+	{
+		const std::string path = this->get_parameter("startup.replay_file").as_string();
+		if (path.empty())
+		{
+			return false;
+		}
+		timer_->cancel();
+		map_pub_timer_->cancel();
+		GroupReplay replay(path);
+		const bool check_points = this->get_parameter("startup.replay_check_point_count").as_bool();
+		while (rclcpp::ok() && replay.Next(Measures, *p_pre, check_points))
+		{
+			ProcessCurrentGroup();
+		}
+		return true;
+	}
+
 private:
     void timer_callback()
     {
         if(sync_packages(Measures))
         {
+			ProcessCurrentGroup();
+		}
+	}
+
+	void ProcessCurrentGroup()
+	{
 			StartupTrace::Get().GroupSelected(Measures);
 			trace_state("before_imu");
             if (flg_first_scan)
@@ -1191,7 +1220,6 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
-        }
     }
 
     void map_publish_callback()
@@ -1247,7 +1275,12 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+	auto node = std::make_shared<LaserMappingNode>();
+	if (!node->ReplayIfRequested())
+	{
+		rclcpp::spin(node);
+	}
+	node.reset();
 
     if (rclcpp::ok())
         rclcpp::shutdown();
