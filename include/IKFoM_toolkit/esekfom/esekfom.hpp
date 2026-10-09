@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <cstdlib>
+#include <stdexcept>
 
 #include <boost/bind.hpp>
 #include <Eigen/Core>
@@ -1813,6 +1814,10 @@ public:
 
 			//K_x = K_ * h_x_;
 			Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; 
+			if (frozen_vector_size_ > 0)
+			{
+				dx_.segment(frozen_vector_index_, frozen_vector_size_).setZero();
+			}
 			state x_before = x_;
 			x_.boxplus(dx_);
 			dyn_share.converge = true;
@@ -1922,6 +1927,16 @@ public:
 				// else
 				//{
 					P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
+				if (frozen_vector_size_ > 0)
+				{
+					// Schmidt update: active-state and cross covariance equal the
+					// unrestricted update; nuisance-state covariance stays at its
+					// prior. This is equivalent to zeroing those gain rows in the
+					// Joseph form, without pretending the frozen bias is known exactly.
+					P_.block(frozen_vector_index_, frozen_vector_index_,
+						frozen_vector_size_, frozen_vector_size_) = P_propagated.block(
+						frozen_vector_index_, frozen_vector_index_, frozen_vector_size_, frozen_vector_size_);
+				}
 				//}
 				solve_time += omp_get_wtime() - solve_start;
 				return;
@@ -1946,6 +1961,18 @@ public:
 		P_ = input_cov;
 	}
 
+	// Diagnostic Schmidt nuisance block. Only Euclidean vector components are
+	// supported, and their process random walk must be disabled by the caller.
+	void set_frozen_vector_block(int index, int size)
+	{
+		if (index < 0 || size < 0 || index + size > n)
+		{
+			throw std::invalid_argument("Invalid frozen vector block");
+		}
+		frozen_vector_index_ = index;
+		frozen_vector_size_ = size;
+	}
+
 	const state& get_x() const {
 		return x_;
 	}
@@ -1953,6 +1980,8 @@ public:
 		return P_;
 	}
 private:
+	int frozen_vector_index_ = 0;
+	int frozen_vector_size_ = 0;
 	state x_;
 	measurement m_;
 	cov P_;

@@ -881,6 +881,7 @@ public:
     {
         this->declare_parameter<std::string>("startup.replay_file", "");
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
+		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -985,6 +986,12 @@ public:
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+		if (this->get_parameter("startup.freeze_gyro_bias").as_bool())
+		{
+			kf.set_frozen_vector_block(15, 3);
+			p_imu->set_gyr_bias_cov(V3D::Zero());
+			RCLCPP_WARN(this->get_logger(), "Diagnostic Schmidt gyro-bias freeze enabled; gyro-bias process noise is zero");
+		}
 
         /*** debug record ***/
         // FILE *fp;

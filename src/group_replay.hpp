@@ -51,6 +51,9 @@ public:
 			const uint64_t source_imu = Read<uint64_t>();
 			auto imu = Message<sensor_msgs::msg::Imu>();
 			const uint64_t trace_imu = StartupTrace::Get().Input(1, *imu, imu.get());
+			const int64_t stamp = int64_t(imu->header.stamp.sec) * 1000000000 + imu->header.stamp.nanosec;
+			StartupTrace::Get().Event("imu_callback," + std::to_string(trace_imu)
+				+ "," + std::to_string(stamp) + "," + std::to_string(stamp));
 			StartupTrace::Get().Event("replay_imu," + std::to_string(source_imu)
 				+ "," + std::to_string(trace_imu));
 			group.imu.push_back(std::move(imu));
