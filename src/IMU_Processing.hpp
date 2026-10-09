@@ -94,6 +94,8 @@ ImuProcess::ImuProcess()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
+	acc_s_last = Zero3d;
+	last_lidar_end_time_ = 0.0;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -107,6 +109,9 @@ void ImuProcess::Reset()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last       = Zero3d;
+	acc_s_last = Zero3d;
+	last_lidar_end_time_ = 0.0;
+	b_first_frame_ = true;
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
@@ -224,6 +229,18 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
+	// The initial state represents the last IMU used for calibration, not an
+	// uninitialized timestamp or the beginning of the first cloud.
+	last_lidar_end_time_ = rclcpp::Time(last_imu_->header.stamp).seconds();
+	const auto& acceleration = last_imu_->linear_acceleration;
+	const auto& gyro = last_imu_->angular_velocity;
+	angvel_last = V3D(gyro.x, gyro.y, gyro.z) - init_state.bg;
+	acc_s_last = init_state.rot * (V3D(acceleration.x, acceleration.y, acceleration.z)
+		* G_m_s2 / mean_acc.norm() - init_state.ba);
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		acc_s_last[axis] += init_state.grav[axis];
+	}
 
 }
 
@@ -255,6 +272,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+	// A group may contain only the previous endpoint. The final extrapolation
+	// still needs a defined input even if every pair in the loop is skipped.
+	const auto& previous_acceleration = last_imu_->linear_acceleration;
+	const auto& previous_gyro = last_imu_->angular_velocity;
+	in.acc = V3D(previous_acceleration.x, previous_acceleration.y, previous_acceleration.z)
+		* G_m_s2 / mean_acc.norm();
+	in.gyro = V3D(previous_gyro.x, previous_gyro.y, previous_gyro.z);
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -358,7 +382,11 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
-  if(meas.imu.empty()) {return;};
+	cur_pcl_un_->clear();
+	if (meas.imu.empty())
+	{
+		return;
+	}
   assert(meas.lidar != nullptr);
 
   if (imu_need_init_)
