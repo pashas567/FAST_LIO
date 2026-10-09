@@ -886,6 +886,12 @@ public:
         this->declare_parameter<std::string>("startup.replay_file", "");
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
 		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
+		const bool synchronous_map_rebuild = this->declare_parameter<bool>("startup.synchronous_map_rebuild", false);
+		ikdtree.Set_Synchronous_Rebuild(synchronous_map_rebuild);
+		if (synchronous_map_rebuild)
+		{
+			RCLCPP_WARN(this->get_logger(), "Diagnostic synchronous map rebuild enabled; background scheduling removed");
+		}
 		ground_init_ = this->declare_parameter<bool>("startup.ground_init", false);
 		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
 		if (!std::isfinite(cloud_delay_seconds_) || cloud_delay_seconds_ < 0.0)
