@@ -1,12 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -115,6 +115,8 @@ public:
 			return;
 		}
 		saved_ = true;
+		// ROS launch may send another SIGINT while shutdown flushes this buffer.
+		const auto previous_interrupt = std::signal(SIGINT, SIG_IGN);
 		std::ofstream inputs(directory_ + "/inputs.cdr", std::ios::binary);
 		std::ofstream events(directory_ + "/events.csv");
 		inputs.write("FLTR0001", 8);
@@ -143,6 +145,7 @@ public:
 		{
 			std::cerr << "Startup trace save failed: " << directory_ << std::endl;
 		}
+		std::signal(SIGINT, previous_interrupt);
 	}
 
 	~StartupTrace()
