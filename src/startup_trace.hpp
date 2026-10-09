@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include <rclcpp/serialization.hpp>
@@ -47,6 +48,10 @@ public:
 		if (bytes_ + data.buffer_length > max_bytes_)
 		{
 			++dropped_;
+			if (identity)
+			{
+				identities_.erase(identity);
+			}
 			return 0;
 		}
 		Record record;
@@ -165,6 +170,7 @@ public:
 		manifest << "{\"schema\":1,\"duration_s\":" << duration_s_
 			<< ",\"records\":" << records_.size() << ",\"groups\":" << group_
 			<< ",\"input_bytes\":" << bytes_ << ",\"event_bytes\":" << event_bytes_
+			<< ",\"max_input_bytes\":" << max_bytes_ << ",\"max_event_bytes\":" << max_event_bytes_
 			<< ",\"dropped_trace_records\":" << dropped_
 			<< ",\"saved\":" << (successful ? "true" : "false") << "}\n";
 		if (!successful || !manifest.good())
@@ -201,6 +207,19 @@ private:
 		{
 			duration_s_ = std::stod(duration);
 		}
+		max_bytes_ = Budget("FASTLIO_STARTUP_TRACE_MAX_MB", 256, 2048);
+		max_event_bytes_ = Budget("FASTLIO_STARTUP_TRACE_EVENT_MB", 16, 256);
+	}
+
+	static size_t Budget(const char* name, unsigned long default_mb, unsigned long maximum_mb)
+	{
+		const char* setting = std::getenv(name);
+		const unsigned long megabytes = setting ? std::stoul(setting) : default_mb;
+		if (megabytes == 0 || megabytes > maximum_mb)
+		{
+			throw std::invalid_argument(std::string(name) + " is outside the trace memory limit");
+		}
+		return megabytes * 1024 * 1024;
 	}
 
 	template<class Value>
@@ -215,8 +234,8 @@ private:
 	bool saved_ = false;
 	size_t bytes_ = 0;
 	size_t event_bytes_ = 0;
-	const size_t max_bytes_ = 256 * 1024 * 1024;
-	const size_t max_event_bytes_ = 16 * 1024 * 1024;
+	size_t max_bytes_ = 256 * 1024 * 1024;
+	size_t max_event_bytes_ = 16 * 1024 * 1024;
 	uint64_t sequence_ = 0;
 	uint64_t group_ = 0;
 	uint64_t dropped_ = 0;
