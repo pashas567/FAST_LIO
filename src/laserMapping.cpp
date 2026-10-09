@@ -882,6 +882,11 @@ public:
         this->declare_parameter<std::string>("startup.replay_file", "");
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
 		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
+		const int imu_queue_depth = this->declare_parameter<int>("common.imu_queue_depth", 400);
+		if (imu_queue_depth < 1 || imu_queue_depth > 10000)
+		{
+			throw std::invalid_argument("common.imu_queue_depth must be between 1 and 10000");
+		}
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -1016,7 +1021,9 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+		// SDK1 drains IMU in bursts; ten queued samples cover only 50 ms.
+		sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(), imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
