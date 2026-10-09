@@ -887,6 +887,16 @@ public:
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
 		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
 		ground_init_ = this->declare_parameter<bool>("startup.ground_init", false);
+		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
+		if (!std::isfinite(cloud_delay_seconds_) || cloud_delay_seconds_ < 0.0)
+		{
+			throw std::invalid_argument("startup.cloud_delay_seconds must be finite and nonnegative");
+		}
+		if (cloud_delay_seconds_ > 0.0 && !ground_init_
+			&& this->get_parameter("startup.replay_file").as_string().empty())
+		{
+			throw std::invalid_argument("Cloud delay requires stationary ground initialization");
+		}
 		const int imu_queue_depth = this->declare_parameter<int>("common.imu_queue_depth", 400);
 		if (imu_queue_depth < 1 || imu_queue_depth > 10000)
 		{
@@ -1097,6 +1107,11 @@ public:
 			flg_first_scan = false;
 			trace_state("ground_initialized");
 			p_imu->AdvanceStationary(replay.LastGroundImu);
+			cloud_release_stamp_ = get_time_sec(replay.LastGroundImu->header.stamp);
+		}
+		else if (cloud_delay_seconds_ > 0.0)
+		{
+			throw std::invalid_argument("Cloud delay replay requires recorded ground initialization");
 		}
 		const bool check_points = this->get_parameter("startup.replay_check_point_count").as_bool();
 		while (rclcpp::ok() && replay.Next(Measures, *p_pre, check_points))
@@ -1133,6 +1148,7 @@ private:
 			if (ground_ready_)
 			{
 				ground_released_ = true;
+				cloud_release_stamp_ = ground_stamp_;
 				ground_phase_ = "IMU_READY_RELEASED";
 				StartupTrace::Get().Event("ground_release");
 				return;
@@ -1148,6 +1164,7 @@ private:
 		{
 			// Never conceal motion or a time discontinuity by extending a hold.
 			ground_released_ = true;
+			cloud_release_stamp_ = ground_stamp_;
 			ground_phase_ = "IMU_READY_RELEASED";
 			StartupTrace::Get().Event(std::string("ground_release,") + stationary_.reason);
 			return;
@@ -1231,6 +1248,23 @@ private:
 			trace_state("after_imu");
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+			// Keep the original IMU integration boundaries and deskew. Discard
+			// early scans before both map creation and measurement updates;
+			// never enqueue them for processing when the gate opens.
+			if (cloud_delay_seconds_ > 0.0)
+			{
+				if (Measures.lidar_beg_time < cloud_release_stamp_ + cloud_delay_seconds_)
+				{
+					trace_state("cloud_delayed");
+					return;
+				}
+				if (!cloud_delay_opened_)
+				{
+					cloud_delay_opened_ = true;
+					StartupTrace::Get().Event("cloud_delay_opened");
+				}
+			}
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
@@ -1390,6 +1424,9 @@ private:
 	bool ground_released_ = false;
 	bool ground_failed_ = false;
 	double ground_stamp_ = 0.0;
+	double cloud_delay_seconds_ = 0.0;
+	double cloud_release_stamp_ = 0.0;
+	bool cloud_delay_opened_ = false;
 	std::string ground_phase_ = "WAIT_LANDED_DISARMED";
 	StationaryWindow stationary_;
 	mavros_msgs::msg::State::ConstSharedPtr ground_state_;
