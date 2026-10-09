@@ -167,6 +167,16 @@ void TestMeasuredStationaryCovariance()
 	const auto measured = StationaryGyroMeanCovariance(group.imu);
 	Check((measured - expected).norm() < 1e-12,
 		"Correlated block means were treated as independent IMU samples");
+	auto rounded = group.imu;
+	for (size_t index = 0; index < rounded.size(); ++index)
+	{
+		auto sample = std::make_shared<sensor_msgs::msg::Imu>(*rounded[index]);
+		const int64_t stamp = rclcpp::Time(sample->header.stamp).nanoseconds();
+		sample->header.stamp = rclcpp::Time(stamp + (index % 3 == 0 ? 125 : -125));
+		rounded[index] = sample;
+	}
+	Check((StationaryGyroMeanCovariance(rounded) - measured).norm() < 1e-12,
+		"Sub-microsecond clock rounding changed the bias covariance");
 	Filter filter;
 	Initialize(filter);
 	ImuProcess imu;

@@ -40,6 +40,17 @@ public:
 		}
 		const uint64_t receive_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::system_clock::now().time_since_epoch()).count();
+		if (!input_reference_.empty())
+		{
+			const uint64_t sequence = ++sequence_;
+			if (identity)
+			{
+				identities_[identity] = sequence;
+			}
+			Event("referenced_input," + std::to_string(sequence) + ","
+				+ std::to_string(receive_ns) + "," + std::to_string(kind));
+			return sequence;
+		}
 		rclcpp::SerializedMessage serialized;
 		rclcpp::Serialization<Message> serializer;
 		serializer.serialize_message(&message, &serialized);
@@ -171,6 +182,8 @@ public:
 			<< ",\"records\":" << records_.size() << ",\"groups\":" << group_
 			<< ",\"input_bytes\":" << bytes_ << ",\"event_bytes\":" << event_bytes_
 			<< ",\"max_input_bytes\":" << max_bytes_ << ",\"max_event_bytes\":" << max_event_bytes_
+			<< ",\"input_reference\":" << std::quoted(input_reference_)
+			<< ",\"referenced_records\":" << (input_reference_.empty() ? 0 : sequence_)
 			<< ",\"dropped_trace_records\":" << dropped_
 			<< ",\"saved\":" << (successful ? "true" : "false") << "}\n";
 		if (!successful || !manifest.good())
@@ -209,6 +222,17 @@ private:
 		}
 		max_bytes_ = Budget("FASTLIO_STARTUP_TRACE_MAX_MB", 256, 2048);
 		max_event_bytes_ = Budget("FASTLIO_STARTUP_TRACE_EVENT_MB", 16, 256);
+		const char* reference = std::getenv("FASTLIO_STARTUP_TRACE_INPUT_REFERENCE");
+		if (reference && reference[0] != '\0')
+		{
+			std::ifstream input(reference, std::ios::binary);
+			char magic[8];
+			if (!input.read(magic, sizeof(magic)) || std::string(magic, sizeof(magic)) != "FLGR0002")
+			{
+				throw std::invalid_argument("Referenced trace inputs require frozen ground replay groups");
+			}
+			input_reference_ = reference;
+		}
 	}
 
 	static size_t Budget(const char* name, unsigned long default_mb, unsigned long maximum_mb)
@@ -229,6 +253,7 @@ private:
 	}
 
 	std::string directory_;
+	std::string input_reference_;
 	Clock::time_point started_;
 	double duration_s_ = 35.0;
 	bool saved_ = false;

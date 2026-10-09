@@ -256,6 +256,9 @@ M3D StationaryGyroMeanCovariance(const deque<sensor_msgs::msg::Imu::ConstSharedP
 	// Use 200 ms block means rather than treating correlated contact vibration
 	// as independent white sensor noise at every 5 ms sample.
 	constexpr int64_t block_ns = 200000000;
+	// Unix seconds converted through double can perturb a 5 ms boundary by
+	// a few hundred ns. Do not move a full sample to the preceding block.
+	constexpr int64_t clock_rounding_ns = 1000;
 	const int64_t origin = rclcpp::Time(samples.front()->header.stamp).nanoseconds();
 	vector<V3D> means;
 	V3D sum = V3D::Zero();
@@ -266,7 +269,7 @@ M3D StationaryGyroMeanCovariance(const deque<sensor_msgs::msg::Imu::ConstSharedP
 	for (const auto& sample : samples)
 	{
 		const int64_t stamp = rclcpp::Time(sample->header.stamp).nanoseconds();
-		const int64_t current_block = (stamp - origin) / block_ns;
+		const int64_t current_block = (stamp - origin + clock_rounding_ns) / block_ns;
 		if (current_block != block)
 		{
 			if (count >= 2 && last - first >= 180000000)
