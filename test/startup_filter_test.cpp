@@ -145,11 +145,43 @@ void TestStationaryWindowAndRelease()
 	}
 }
 
-int main()
+void TestRecordedStationaryWindow(const char* path)
+{
+	std::ifstream input(path);
+	Check(input.good(), "Cannot open recorded stationary IMU");
+	StationaryWindow window;
+	std::string line;
+	int evaluated = 0;
+	while (std::getline(input, line))
+	{
+		std::replace(line.begin(), line.end(), ',', ' ');
+		std::istringstream row(line);
+		int64_t timestamp;
+		auto sample = std::make_shared<sensor_msgs::msg::Imu>();
+		auto& a = sample->linear_acceleration;
+		auto& w = sample->angular_velocity;
+		Check(bool(row >> timestamp >> a.x >> a.y >> a.z >> w.x >> w.y >> w.z), "Malformed IMU fixture");
+		sample->header.stamp = rclcpp::Time(timestamp);
+		const bool ready = window.Append(sample);
+		if (!window.samples.empty() && timestamp - StationaryWindow::Stamp(window.samples.front()) >= 2000000000)
+		{
+			Check(ready, "Recorded stationary contact falsely classified as motion");
+			++evaluated;
+		}
+	}
+	Check(evaluated > 1000, "Recorded fixture is too short");
+	std::cout << "Recorded stationary windows passed: " << evaluated << std::endl;
+}
+
+int main(int argc, char** argv)
 {
 	TestSchmidtCovariance();
 	TestPredictionAfterInitializationAndReset();
 	TestStationaryWindowAndRelease();
+	if (argc == 2)
+	{
+		TestRecordedStationaryWindow(argv[1]);
+	}
 	std::cout << "Startup history and Schmidt covariance checks passed" << std::endl;
 	return 0;
 }

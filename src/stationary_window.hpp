@@ -6,7 +6,7 @@
 #include <Eigen/Core>
 
 // Time-based initialization, independent of whether the lidar sees any surface.
-// Evaluate 100 ms means: contact vibration must not be mistaken for sustained
+// Evaluate 200 ms means: contact vibration must not be mistaken for sustained
 // acceleration, but its impulse must already be preserved by the sensor path.
 class StationaryWindow
 {
@@ -60,10 +60,12 @@ public:
 		{
 			return false;
 		}
-		Eigen::Vector3d acceleration[20];
-		Eigen::Vector3d gyro[20];
-		int counts[20] = {};
-		for (int index = 0; index < 20; ++index)
+		constexpr int BlockCount = 10;
+		constexpr int64_t BlockNs = 200000000;
+		Eigen::Vector3d acceleration[BlockCount];
+		Eigen::Vector3d gyro[BlockCount];
+		int counts[BlockCount] = {};
+		for (int index = 0; index < BlockCount; ++index)
 		{
 			acceleration[index].setZero();
 			gyro[index].setZero();
@@ -76,7 +78,7 @@ public:
 			{
 				continue;
 			}
-			const int index = int(offset / 100000000);
+			const int index = int(offset / BlockNs);
 			const auto& force = value->linear_acceleration;
 			const auto& omega = value->angular_velocity;
 			acceleration[index] += Eigen::Vector3d(force.x, force.y, force.z);
@@ -84,18 +86,18 @@ public:
 			++counts[index];
 		}
 		Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-		for (int index = 0; index < 20; ++index)
+		for (int index = 0; index < BlockCount; ++index)
 		{
-			if (counts[index] < 10)
+			if (counts[index] < 20)
 			{
 				reason = "sparse_window";
 				return false;
 			}
 			acceleration[index] /= counts[index];
 			gyro[index] /= counts[index];
-			mean += acceleration[index] / 20.0;
+			mean += acceleration[index] / BlockCount;
 		}
-		for (int index = 0; index < 20; ++index)
+		for (int index = 0; index < BlockCount; ++index)
 		{
 			if (std::abs(mean.norm() - 9.81) > 0.3 || (acceleration[index] - mean).norm() > 0.3
 				|| gyro[index].norm() > 0.02)
