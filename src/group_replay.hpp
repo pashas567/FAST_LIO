@@ -14,11 +14,28 @@ public:
 	{
 		char magic[8];
 		input_.read(magic, sizeof(magic));
-		if (!input_ || std::memcmp(magic, "FLGR0001", sizeof(magic)) != 0)
+		const bool ground_start = std::memcmp(magic, "FLGR0002", sizeof(magic)) == 0;
+		if (!input_ || (!ground_start && std::memcmp(magic, "FLGR0001", sizeof(magic)) != 0))
 		{
 			throw std::runtime_error("Invalid fixed-group replay header");
 		}
+		if (ground_start)
+		{
+			const uint32_t count = Read<uint32_t>();
+			if (count < 2 || count > 10000)
+			{
+				throw std::runtime_error("Invalid ground initialization sample count");
+			}
+			for (uint32_t index = 0; index < count; ++index)
+			{
+				GroundImu.push_back(Message<sensor_msgs::msg::Imu>());
+			}
+			LastGroundImu = Message<sensor_msgs::msg::Imu>();
+		}
 	}
+
+	std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> GroundImu;
+	sensor_msgs::msg::Imu::ConstSharedPtr LastGroundImu;
 
 	bool Next(MeasureGroup& group, Preprocess& preprocess, bool check_point_count)
 	{

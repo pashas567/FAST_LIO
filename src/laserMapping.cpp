@@ -1089,6 +1089,15 @@ public:
 		timer_->cancel();
 		map_pub_timer_->cancel();
 		GroupReplay replay(path);
+		if (!replay.GroundImu.empty())
+		{
+			p_imu->InitializeStationary(replay.GroundImu, kf);
+			first_lidar_time = get_time_sec(replay.GroundImu.back()->header.stamp);
+			p_imu->first_lidar_time = first_lidar_time;
+			flg_first_scan = false;
+			trace_state("ground_initialized");
+			p_imu->AdvanceStationary(replay.LastGroundImu);
+		}
 		const bool check_points = this->get_parameter("startup.replay_check_point_count").as_bool();
 		while (rclcpp::ok() && replay.Next(Measures, *p_pre, check_points))
 		{
