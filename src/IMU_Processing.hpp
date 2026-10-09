@@ -20,6 +20,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "use-ikfom.hpp"
+#include "startup_trace.hpp"
 
 /// *************Preconfiguration
 
@@ -178,6 +179,22 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+
+	if (StartupTrace::Get().Active())
+	{
+		std::ostringstream sample;
+		sample << std::setprecision(17) << "init_sample," << StartupTrace::Get().GroupId()
+			<< ',' << N << ',' << int64_t(imu->header.stamp.sec) * 1000000000 + imu->header.stamp.nanosec;
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			sample << ',' << cur_acc[axis];
+		}
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			sample << ',' << cur_gyr[axis];
+		}
+		StartupTrace::Get().Event(sample.str());
+	}
 
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
@@ -362,6 +379,21 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       std::cout << "IMU Initial Done" << std::endl;
+		if (StartupTrace::Get().Active())
+		{
+			std::ostringstream summary;
+			summary << std::setprecision(17) << "init_done," << StartupTrace::Get().GroupId()
+				<< ',' << init_iter_num << ',' << mean_acc.norm() << ',' << G_m_s2 / mean_acc.norm();
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				summary << ',' << mean_acc[axis];
+			}
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				summary << ',' << mean_gyr[axis];
+			}
+			StartupTrace::Get().Event(summary.str());
+		}
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);

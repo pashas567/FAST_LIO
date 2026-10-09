@@ -143,6 +143,73 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+// These checkpoints read state only, including empty scans before map creation.
+void trace_state(const char* stage)
+{
+	if (!StartupTrace::Get().Active())
+	{
+		return;
+	}
+	const state_ikfom state = kf.get_x();
+	const auto covariance = kf.get_P();
+	std::ostringstream record;
+	record << std::setprecision(17) << "state," << StartupTrace::Get().GroupId()
+		<< ',' << stage << ',' << Measures.lidar_beg_time << ',' << Measures.lidar_end_time;
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.pos[axis];
+	}
+	for (int axis = 0; axis < 4; ++axis)
+	{
+		record << ',' << state.rot.coeffs()[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.vel[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.grav[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.bg[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.ba[axis];
+	}
+	for (int axis = 0; axis < covariance.rows(); ++axis)
+	{
+		record << ',' << covariance(axis, axis);
+	}
+	StartupTrace::Get().Event(record.str());
+}
+
+void trace_measurement(const Eigen::MatrixXd& jacobian, double residual, bool rematched)
+{
+	if (!StartupTrace::Get().Active())
+	{
+		return;
+	}
+	const Eigen::Matrix<double, 6, 6> information = jacobian.leftCols(6).transpose() * jacobian.leftCols(6);
+	const Eigen::Matrix3d translation_information = information.topLeftCorner<3, 3>();
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> full(information);
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> translation(translation_information);
+	std::ostringstream record;
+	record << std::setprecision(17) << "measurement," << StartupTrace::Get().GroupId()
+		<< ',' << jacobian.rows() << ',' << residual << ',' << rematched;
+	for (int axis = 0; axis < 6; ++axis)
+	{
+		record << ',' << full.eigenvalues()[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << translation.eigenvalues()[axis];
+	}
+	StartupTrace::Get().Event(record.str());
+}
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -312,6 +379,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
+	StartupTrace::Get().Input(2, *msg);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -373,6 +441,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     last_timestamp_imu = timestamp;
 
+	const uint64_t trace_sequence = StartupTrace::Get().Input(1, *msg_in, msg.get());
+	if (StartupTrace::Get().Active())
+	{
+		std::ostringstream record;
+		record << "imu_callback," << trace_sequence << ','
+			<< int64_t(msg_in->header.stamp.sec) * 1000000000 + msg_in->header.stamp.nanosec << ','
+			<< int64_t(msg->header.stamp.sec) * 1000000000 + msg->header.stamp.nanosec;
+		StartupTrace::Get().Event(record.str());
+	}
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -747,6 +824,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
+		StartupTrace::Get().Event("measurement_empty," + std::to_string(StartupTrace::Get().GroupId()));
         std::cerr << "No Effective Points!" << std::endl;
         // ROS_WARN("No Effective Points! \n");
         return;
@@ -790,6 +868,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+	trace_measurement(ekfom_data.h_x, res_mean_last, ekfom_data.converge);
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -952,6 +1031,7 @@ public:
         fout_out.close();
         fout_pre.close();
         fclose(fp);
+		StartupTrace::Get().Save();
     }
 
 private:
@@ -959,6 +1039,8 @@ private:
     {
         if(sync_packages(Measures))
         {
+			StartupTrace::Get().GroupSelected(Measures);
+			trace_state("before_imu");
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -977,11 +1059,13 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+			trace_state("after_imu");
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
+				trace_state("empty_scan");
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
             }
@@ -1009,6 +1093,7 @@ private:
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
                     ikdtree.Build(feats_down_world->points);
+					trace_state("map_created");
                 }
                 return;
             }
@@ -1049,7 +1134,9 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+			trace_state("before_update");
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+			trace_state("after_update");
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
