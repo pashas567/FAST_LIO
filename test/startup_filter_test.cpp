@@ -145,6 +145,55 @@ void TestStationaryWindowAndRelease()
 	}
 }
 
+void TestMeasuredStationaryCovariance()
+{
+	const double epoch = 1791558687.0;
+	auto group = StationaryGroup(epoch, epoch + 2.0, epoch, 401);
+	const V3D step(0.001, 0.002, -0.003);
+	V3D mean = V3D::Zero();
+	for (size_t index = 0; index < group.imu.size(); ++index)
+	{
+		auto sample = std::make_shared<sensor_msgs::msg::Imu>(*group.imu[index]);
+		const V3D value = V3D::Constant(0.01) + double(index / 40) * step;
+		sample->angular_velocity.x = value[0];
+		sample->angular_velocity.y = value[1];
+		sample->angular_velocity.z = value[2];
+		group.imu[index] = sample;
+		mean += value;
+	}
+	mean /= double(group.imu.size());
+	M3D expected = (82.5 / 90.0) * step * step.transpose();
+	expected.diagonal().array() += 1e-12;
+	const auto measured = StationaryGyroMeanCovariance(group.imu);
+	Check((measured - expected).norm() < 1e-12,
+		"Correlated block means were treated as independent IMU samples");
+	Filter filter;
+	Initialize(filter);
+	ImuProcess imu;
+	imu.set_gyr_cov(V3D::Constant(0.01));
+	imu.set_acc_cov(V3D::Constant(0.05));
+	imu.InitializeStationary(group.imu, filter, true);
+	Check((filter.get_x().bg - mean).norm() < 1e-12, "Measured prior changed gyro-bias mean");
+	Check((filter.get_P().block<3, 3>(15, 15) - expected).norm() < 1e-12,
+		"Measured prior was written into the wrong state block");
+	Eigen::SelfAdjointEigenSolver<Filter::cov> eigenvalues(filter.get_P());
+	Check(eigenvalues.eigenvalues().minCoeff() > 0.0, "Measured prior is not positive definite");
+	auto constant = StationaryGroup(epoch, epoch + 2.0, epoch, 401);
+	Check((StationaryGyroMeanCovariance(constant.imu) - M3D::Identity() * 1e-12).norm() < 1e-20,
+		"Constant sensor lost the positive-definite covariance floor");
+	constant.imu.resize(350);
+	bool rejected = false;
+	try
+	{
+		StationaryGyroMeanCovariance(constant.imu);
+	}
+	catch (const std::invalid_argument&)
+	{
+		rejected = true;
+	}
+	Check(rejected, "Incomplete two-second block window was accepted");
+}
+
 void TestRecordedStationaryWindow(const char* path)
 {
 	std::ifstream input(path);
@@ -178,6 +227,7 @@ int main(int argc, char** argv)
 	TestSchmidtCovariance();
 	TestPredictionAfterInitializationAndReset();
 	TestStationaryWindowAndRelease();
+	TestMeasuredStationaryCovariance();
 	if (argc == 2)
 	{
 		TestRecordedStationaryWindow(argv[1]);

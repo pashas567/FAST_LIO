@@ -50,7 +50,7 @@ class ImuProcess
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 	void InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
-		esekfom::esekf<state_ikfom, 12, input_ikfom>& filter);
+		esekfom::esekf<state_ikfom, 12, input_ikfom>& filter, bool measured_bias_covariance = false);
 	void AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample);
 
   ofstream fout_imu;
@@ -247,8 +247,70 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
 }
 
+M3D StationaryGyroMeanCovariance(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples)
+{
+	if (samples.empty())
+	{
+		throw std::invalid_argument("Stationary gyro prior requires IMU samples");
+	}
+	// Use 200 ms block means rather than treating correlated contact vibration
+	// as independent white sensor noise at every 5 ms sample.
+	constexpr int64_t block_ns = 200000000;
+	const int64_t origin = rclcpp::Time(samples.front()->header.stamp).nanoseconds();
+	vector<V3D> means;
+	V3D sum = V3D::Zero();
+	int64_t block = 0;
+	int64_t first = origin;
+	int64_t last = origin;
+	int count = 0;
+	for (const auto& sample : samples)
+	{
+		const int64_t stamp = rclcpp::Time(sample->header.stamp).nanoseconds();
+		const int64_t current_block = (stamp - origin) / block_ns;
+		if (current_block != block)
+		{
+			if (count >= 2 && last - first >= 180000000)
+			{
+				means.push_back(sum / count);
+			}
+			block = current_block;
+			first = stamp;
+			sum.setZero();
+			count = 0;
+		}
+		const auto& gyro = sample->angular_velocity;
+		sum += V3D(gyro.x, gyro.y, gyro.z);
+		last = stamp;
+		++count;
+	}
+	if (count >= 2 && last - first >= 180000000)
+	{
+		means.push_back(sum / count);
+	}
+	if (means.size() < 10)
+	{
+		throw std::invalid_argument("Stationary gyro prior requires ten complete 200 ms blocks");
+	}
+	V3D mean = V3D::Zero();
+	for (const auto& value : means)
+	{
+		mean += value;
+	}
+	mean /= static_cast<double>(means.size());
+	M3D covariance = M3D::Zero();
+	for (const auto& value : means)
+	{
+		const V3D difference = value - mean;
+		covariance += difference * difference.transpose();
+	}
+	covariance /= static_cast<double>(means.size() * (means.size() - 1));
+	// Keep the prior positive definite even for an exactly constant sensor.
+	covariance.diagonal().array() += 1e-12;
+	return covariance;
+}
+
 void ImuProcess::InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
-	esekfom::esekf<state_ikfom, 12, input_ikfom>& filter)
+	esekfom::esekf<state_ikfom, 12, input_ikfom>& filter, bool measured_bias_covariance)
 {
 	if (samples.empty())
 	{
@@ -259,7 +321,16 @@ void ImuProcess::InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSh
 	group.imu = samples;
 	group.lidar_beg_time = rclcpp::Time(samples.front()->header.stamp).seconds();
 	group.lidar_end_time = rclcpp::Time(samples.back()->header.stamp).seconds();
+	const M3D bias_covariance = measured_bias_covariance
+		? StationaryGyroMeanCovariance(samples) : M3D::Zero();
 	IMU_init(group, filter, init_iter_num);
+	if (measured_bias_covariance)
+	{
+		auto covariance = filter.get_P();
+		covariance.block<3, 3>(15, 15) = bias_covariance;
+		filter.change_P(covariance);
+		StartupTrace::Get().Event("stationary_gyro_covariance_measured");
+	}
 	cov_acc = cov_acc_scale;
 	cov_gyr = cov_gyr_scale;
 	imu_need_init_ = false;

@@ -893,6 +893,7 @@ public:
 			RCLCPP_WARN(this->get_logger(), "Diagnostic synchronous map rebuild enabled; background scheduling removed");
 		}
 		ground_init_ = this->declare_parameter<bool>("startup.ground_init", false);
+		measured_bias_covariance_ = this->declare_parameter<bool>("startup.measured_stationary_bias_covariance", false);
 		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
 		if (!std::isfinite(cloud_delay_seconds_) || cloud_delay_seconds_ < 0.0)
 		{
@@ -1107,7 +1108,7 @@ public:
 		GroupReplay replay(path);
 		if (!replay.GroundImu.empty())
 		{
-			p_imu->InitializeStationary(replay.GroundImu, kf);
+			p_imu->InitializeStationary(replay.GroundImu, kf, measured_bias_covariance_);
 			first_lidar_time = get_time_sec(replay.GroundImu.back()->header.stamp);
 			p_imu->first_lidar_time = first_lidar_time;
 			flg_first_scan = false;
@@ -1177,7 +1178,7 @@ private:
 		}
 		if (!ground_ready_ && stationary)
 		{
-			p_imu->InitializeStationary(stationary_.samples, kf);
+			p_imu->InitializeStationary(stationary_.samples, kf, measured_bias_covariance_);
 			ground_ready_ = true;
 			flg_first_scan = false;
 			first_lidar_time = get_time_sec(sample->header.stamp);
@@ -1426,6 +1427,7 @@ private:
 
 private:
 	bool ground_init_ = false;
+	bool measured_bias_covariance_ = false;
 	bool ground_ready_ = false;
 	bool ground_released_ = false;
 	bool ground_failed_ = false;
