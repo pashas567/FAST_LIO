@@ -1,6 +1,7 @@
 #include <omp.h>
 #include <rclcpp/rclcpp.hpp>
 #include "IMU_Processing.hpp"
+#include "stationary_window.hpp"
 #include <Eigen/Eigenvalues>
 #include <stdexcept>
 
@@ -95,10 +96,60 @@ void TestPredictionAfterInitializationAndReset()
 	}
 }
 
+void TestStationaryWindowAndRelease()
+{
+	const double epoch = 1791558687.0;
+	auto group = StationaryGroup(epoch, epoch + 2.0, epoch, 401);
+	StationaryWindow window;
+	for (size_t index = 0; index < group.imu.size(); ++index)
+	{
+		const bool ready = window.Append(group.imu[index]);
+		Check(ready == (index == 400), "Initialization did not require two seconds of IMU");
+	}
+	Filter filter;
+	Initialize(filter);
+	ImuProcess imu;
+	imu.set_gyr_cov(V3D::Constant(0.01));
+	imu.set_acc_cov(V3D::Constant(0.05));
+	imu.InitializeStationary(window.samples, filter);
+	auto held = StationaryGroup(epoch + 2, epoch + 10, epoch + 10, 1);
+	imu.AdvanceStationary(held.imu.front());
+	Check(filter.get_x().pos.norm() == 0.0 && filter.get_x().vel.norm() == 0.0,
+		"Ground hold integrated fictitious movement");
+	auto output = std::make_shared<PointCloudXYZI>();
+	imu.Process(StationaryGroup(epoch + 10, epoch + 10.10, epoch + 10, 21), filter, output);
+	// Compare with identical stationary initialization ending at release.
+	// This isolates time spent held from upstream gravity normalization and
+	// the filter's Euler integration convention.
+	Filter reference;
+	Initialize(reference);
+	ImuProcess reference_imu;
+	reference_imu.set_gyr_cov(V3D::Constant(0.01));
+	reference_imu.set_acc_cov(V3D::Constant(0.05));
+	reference_imu.InitializeStationary(StationaryGroup(epoch + 8, epoch + 10, epoch + 8, 401).imu, reference);
+	auto reference_output = std::make_shared<PointCloudXYZI>();
+	reference_imu.Process(StationaryGroup(epoch + 10, epoch + 10.10, epoch + 10, 21), reference, reference_output);
+	Check((filter.get_x().pos - reference.get_x().pos).norm() < 1e-10,
+		"Release integrated time spent stationary");
+	Check((filter.get_x().vel - reference.get_x().vel).norm() < 1e-10,
+		"Release velocity used the wrong integration boundary");
+	Check(!output->empty(), "Ground initializer unexpectedly waited for more initialization clouds");
+	Check(!window.Append(held.imu.front()), "A discontinuous IMU window was accepted");
+	Check(window.samples.size() == 1, "Gap did not discard old calibration samples");
+	window.Clear();
+	for (const auto& sample : group.imu)
+	{
+		auto moving = std::make_shared<sensor_msgs::msg::Imu>(*sample);
+		moving->angular_velocity.z = 0.1;
+		Check(!window.Append(moving), "Rotating body accepted as stationary");
+	}
+}
+
 int main()
 {
 	TestSchmidtCovariance();
 	TestPredictionAfterInitializationAndReset();
+	TestStationaryWindowAndRelease();
 	std::cout << "Startup history and Schmidt covariance checks passed" << std::endl;
 	return 0;
 }

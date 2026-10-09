@@ -62,6 +62,10 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include "group_replay.hpp"
+#include "stationary_window.hpp"
+#include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/msg/extended_state.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
@@ -710,7 +714,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -723,6 +726,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    pubOdomAftMapped->publish(odomAftMapped);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "body";
@@ -882,6 +886,7 @@ public:
         this->declare_parameter<std::string>("startup.replay_file", "");
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
 		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
+		ground_init_ = this->declare_parameter<bool>("startup.ground_init", false);
 		const int imu_queue_depth = this->declare_parameter<int>("common.imu_queue_depth", 400);
 		if (imu_queue_depth < 1 || imu_queue_depth > 10000)
 		{
@@ -1023,7 +1028,28 @@ public:
         }
 		// SDK1 drains IMU in bursts; ten queued samples cover only 50 ms.
 		sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
-			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(), imu_cbk);
+			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(),
+			[this](sensor_msgs::msg::Imu::UniquePtr message)
+			{
+				imu_cbk(std::move(message));
+				ObserveGroundImu();
+			});
+		if (ground_init_)
+		{
+			startup_pub_ = create_publisher<std_msgs::msg::String>("/lio/startup_phase", rclcpp::QoS(1).transient_local());
+			ground_state_sub_ = create_subscription<mavros_msgs::msg::State>("/mavros/state", rclcpp::SensorDataQoS(),
+				[this](mavros_msgs::msg::State::ConstSharedPtr message)
+				{
+					ground_state_ = message;
+					ground_state_time_ = std::chrono::steady_clock::now();
+				});
+			landed_sub_ = create_subscription<mavros_msgs::msg::ExtendedState>("/mavros/extended_state", rclcpp::SensorDataQoS(),
+				[this](mavros_msgs::msg::ExtendedState::ConstSharedPtr message)
+				{
+					landed_state_ = message;
+					landed_time_ = std::chrono::steady_clock::now();
+				});
+		}
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1072,8 +1098,99 @@ public:
 	}
 
 private:
+	void ClearGroundBuffers()
+	{
+		imu_buffer.clear();
+		lidar_buffer.clear();
+		time_buffer.clear();
+		lidar_pushed = false;
+	}
+
+	void ObserveGroundImu()
+	{
+		if (!ground_init_ || ground_released_ || imu_buffer.empty())
+		{
+			return;
+		}
+		const auto sample = imu_buffer.back();
+		const auto now = std::chrono::steady_clock::now();
+		ground_imu_time_ = now;
+		const bool confirmed = ground_state_ && landed_state_ && ground_state_->connected
+			&& !ground_state_->armed && landed_state_->landed_state == mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND
+			&& now - ground_state_time_ < std::chrono::seconds(2)
+			&& now - landed_time_ < std::chrono::seconds(2);
+		if (!confirmed || ground_failed_)
+		{
+			if (ground_ready_)
+			{
+				ground_released_ = true;
+				ground_phase_ = "IMU_READY_RELEASED";
+				StartupTrace::Get().Event("ground_release");
+				return;
+			}
+			ground_failed_ = ground_failed_ || (ground_state_ && ground_state_->armed);
+			ground_phase_ = ground_failed_ ? "FAILED_ARMED_BEFORE_INIT" : "WAIT_LANDED_DISARMED";
+			stationary_.Clear();
+			ClearGroundBuffers();
+			return;
+		}
+		const bool stationary = stationary_.Append(sample);
+		if (ground_ready_ && !stationary)
+		{
+			// Never conceal motion or a time discontinuity by extending a hold.
+			ground_released_ = true;
+			ground_phase_ = "IMU_READY_RELEASED";
+			StartupTrace::Get().Event(std::string("ground_release,") + stationary_.reason);
+			return;
+		}
+		if (!ground_ready_ && stationary)
+		{
+			p_imu->InitializeStationary(stationary_.samples, kf);
+			ground_ready_ = true;
+			flg_first_scan = false;
+			first_lidar_time = get_time_sec(sample->header.stamp);
+			p_imu->first_lidar_time = first_lidar_time;
+			trace_state("ground_initialized");
+		}
+		ground_phase_ = ground_ready_ ? "IMU_READY_GROUND" : std::string("COLLECTING_") + stationary_.reason;
+		if (ground_ready_)
+		{
+			p_imu->AdvanceStationary(sample);
+			ground_stamp_ = get_time_sec(sample->header.stamp);
+		}
+		ClearGroundBuffers();
+	}
+
     void timer_callback()
     {
+		if (ground_init_)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			if (now - startup_publish_time_ >= std::chrono::milliseconds(100))
+			{
+				std_msgs::msg::String phase;
+				const bool fresh = now - ground_imu_time_ < std::chrono::milliseconds(500)
+					&& now - ground_state_time_ < std::chrono::seconds(2)
+					&& now - landed_time_ < std::chrono::seconds(2);
+				phase.data = fresh || ground_released_ ? ground_phase_ : "WAIT_FRESH_INPUT";
+				startup_pub_->publish(phase);
+				startup_publish_time_ = now;
+				if (ground_ready_ && !ground_released_ && fresh)
+				{
+					state_point = kf.get_x();
+					lidar_end_time = ground_stamp_;
+					geoQuat.x = state_point.rot.coeffs()[0];
+					geoQuat.y = state_point.rot.coeffs()[1];
+					geoQuat.z = state_point.rot.coeffs()[2];
+					geoQuat.w = state_point.rot.coeffs()[3];
+					publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+				}
+			}
+			if (!ground_released_)
+			{
+				return;
+			}
+		}
         if(sync_packages(Measures))
         {
 			ProcessCurrentGroup();
@@ -1137,6 +1254,7 @@ private:
                     }
                     ikdtree.Build(feats_down_world->points);
 					trace_state("map_created");
+					ground_phase_ = "MAP_READY";
                 }
                 return;
             }
@@ -1258,6 +1376,19 @@ private:
     }
 
 private:
+	bool ground_init_ = false;
+	bool ground_ready_ = false;
+	bool ground_released_ = false;
+	bool ground_failed_ = false;
+	double ground_stamp_ = 0.0;
+	std::string ground_phase_ = "WAIT_LANDED_DISARMED";
+	StationaryWindow stationary_;
+	mavros_msgs::msg::State::ConstSharedPtr ground_state_;
+	mavros_msgs::msg::ExtendedState::ConstSharedPtr landed_state_;
+	std::chrono::steady_clock::time_point ground_state_time_, landed_time_, ground_imu_time_, startup_publish_time_;
+	rclcpp::Publisher<std_msgs::msg::String>::SharedPtr startup_pub_;
+	rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr ground_state_sub_;
+	rclcpp::Subscription<mavros_msgs::msg::ExtendedState>::SharedPtr landed_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;

@@ -49,6 +49,9 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+	void InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
+		esekfom::esekf<state_ikfom, 12, input_ikfom>& filter);
+	void AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -242,6 +245,35 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 		acc_s_last[axis] += init_state.grav[axis];
 	}
 
+}
+
+void ImuProcess::InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
+	esekfom::esekf<state_ikfom, 12, input_ikfom>& filter)
+{
+	if (samples.empty())
+	{
+		throw std::invalid_argument("Empty stationary initialization");
+	}
+	Reset();
+	MeasureGroup group;
+	group.imu = samples;
+	group.lidar_beg_time = rclcpp::Time(samples.front()->header.stamp).seconds();
+	group.lidar_end_time = rclcpp::Time(samples.back()->header.stamp).seconds();
+	IMU_init(group, filter, init_iter_num);
+	cov_acc = cov_acc_scale;
+	cov_gyr = cov_gyr_scale;
+	imu_need_init_ = false;
+	StartupTrace::Get().Event("ground_imu_initialized");
+}
+
+void ImuProcess::AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample)
+{
+	// Only called while independently confirmed disarmed and landed. Do not
+	// integrate ground contact vibration into fictitious position or velocity.
+	last_imu_ = sample;
+	last_lidar_end_time_ = rclcpp::Time(sample->header.stamp).seconds();
+	angvel_last.setZero();
+	acc_s_last.setZero();
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
