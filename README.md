@@ -193,3 +193,51 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
 ## 6.Acknowledgments
 
 Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).
+
+
+## Avia integration in this fork
+
+The `integration/avia-startup-decoupled` branch combines the `avia-ros2`
+adaptation with the imported `fix/avia-ground-start` history. FAST-LIO does
+not depend on MAVROS. The optional controller interface is
+`fast_lio/msg/InitializationControl`; flight-specific policy belongs in the
+external `lidar_localization_px4` package.
+
+Initialize the pinned submodule before building this branch:
+
+```bash
+python3 scripts/bootstrap_submodules.py
+```
+
+The upstream ikd-Tree base is `e2e3f4e9d3b95a9e66b1ba83dc98d4a05ed8a3c4`.
+The reviewed diagnostic commit `5c5624219575f88c67da8b77bdeb98c302ce8dec` is
+provided by `dependencies/ikd_tree_startup.bundle` (811 bytes), so its
+availability does not depend on an unpublished upstream ref. Synchronous
+rebuild remains disabled by default.
+
+Ordinary LiDAR/IMU operation keeps `startup.stationary_init=false`.
+With `startup.stationary_init=true`, the filter collects two continuous
+seconds of stationary IMU. Without `startup.initialization_control_topic`
+it releases automatically after calibration; with a topic it requires fresh
+ALLOWED messages, then RELEASED to leave the stationary hold. ABORTED,
+release before calibration, or authorization expiry after calibration require
+restarting initialization. Detected motion after calibration also releases
+the hold; IMU discontinuities are failures rather than permission to continue.
+
+The interface commands are BLOCKED=0, ALLOWED=1, RELEASED=2, ABORTED=3.
+The default authorization timeout is one second. `startup.acceleration_scale`
+converts acceleration into SI units for the stationary detector only:
+1.0 for m/s², 9.80665 for SDK1 values in g. It does not rewrite the original
+IMU samples or timestamps; normal FAST-LIO acceleration normalization remains.
+The legacy `startup.ground_init` flag is a deprecated alias for stationary
+initialization, with no implicit MAVROS subscriptions.
+
+Optional replay, startup tracing, measured bias covariance and diagnostic
+bias freezing are preserved. Their defaults remain disabled. `/fastlio/performance`
+contains live timing only; diagnostic fixed-group replay does not publish
+fabricated callback latency. The original mapping/deskew equations, dated
+PCD saving and corrected ROS pose covariance are retained.
+
+Build with `-DBUILD_TESTING=ON` and run `ctest --test-dir <build/fast_lio>`
+to check prediction/reset boundaries, stationary initialization, covariance,
+SDK1 acceleration units and authorization expiry.
