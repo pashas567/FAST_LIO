@@ -20,6 +20,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "use-ikfom.hpp"
+#include "startup_trace.hpp"
 
 /// *************Preconfiguration
 
@@ -48,6 +49,9 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+	void InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
+		esekfom::esekf<state_ikfom, 12, input_ikfom>& filter, bool measured_bias_covariance = false);
+	void AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -93,6 +97,8 @@ ImuProcess::ImuProcess()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
+	acc_s_last = Zero3d;
+	last_lidar_end_time_ = 0.0;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -106,6 +112,9 @@ void ImuProcess::Reset()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last       = Zero3d;
+	acc_s_last = Zero3d;
+	last_lidar_end_time_ = 0.0;
+	b_first_frame_ = true;
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
@@ -179,6 +188,22 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
+	if (StartupTrace::Get().Active())
+	{
+		std::ostringstream sample;
+		sample << std::setprecision(17) << "init_sample," << StartupTrace::Get().GroupId()
+			<< ',' << N << ',' << int64_t(imu->header.stamp.sec) * 1000000000 + imu->header.stamp.nanosec;
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			sample << ',' << cur_acc[axis];
+		}
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			sample << ',' << cur_gyr[axis];
+		}
+		StartupTrace::Get().Event(sample.str());
+	}
+
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
 
@@ -207,7 +232,122 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
+	// The initial state represents the last IMU used for calibration, not an
+	// uninitialized timestamp or the beginning of the first cloud.
+	last_lidar_end_time_ = rclcpp::Time(last_imu_->header.stamp).seconds();
+	const auto& acceleration = last_imu_->linear_acceleration;
+	const auto& gyro = last_imu_->angular_velocity;
+	angvel_last = V3D(gyro.x, gyro.y, gyro.z) - init_state.bg;
+	acc_s_last = init_state.rot * (V3D(acceleration.x, acceleration.y, acceleration.z)
+		* G_m_s2 / mean_acc.norm() - init_state.ba);
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		acc_s_last[axis] += init_state.grav[axis];
+	}
 
+}
+
+M3D StationaryGyroMeanCovariance(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples)
+{
+	if (samples.empty())
+	{
+		throw std::invalid_argument("Stationary gyro prior requires IMU samples");
+	}
+	// Use 200 ms block means rather than treating correlated contact vibration
+	// as independent white sensor noise at every 5 ms sample.
+	constexpr int64_t block_ns = 200000000;
+	// Unix seconds converted through double can perturb a 5 ms boundary by
+	// a few hundred ns. Do not move a full sample to the preceding block.
+	constexpr int64_t clock_rounding_ns = 1000;
+	const int64_t origin = rclcpp::Time(samples.front()->header.stamp).nanoseconds();
+	vector<V3D> means;
+	V3D sum = V3D::Zero();
+	int64_t block = 0;
+	int64_t first = origin;
+	int64_t last = origin;
+	int count = 0;
+	for (const auto& sample : samples)
+	{
+		const int64_t stamp = rclcpp::Time(sample->header.stamp).nanoseconds();
+		const int64_t current_block = (stamp - origin + clock_rounding_ns) / block_ns;
+		if (current_block != block)
+		{
+			if (count >= 2 && last - first >= 180000000)
+			{
+				means.push_back(sum / count);
+			}
+			block = current_block;
+			first = stamp;
+			sum.setZero();
+			count = 0;
+		}
+		const auto& gyro = sample->angular_velocity;
+		sum += V3D(gyro.x, gyro.y, gyro.z);
+		last = stamp;
+		++count;
+	}
+	if (count >= 2 && last - first >= 180000000)
+	{
+		means.push_back(sum / count);
+	}
+	if (means.size() < 10)
+	{
+		throw std::invalid_argument("Stationary gyro prior requires ten complete 200 ms blocks");
+	}
+	V3D mean = V3D::Zero();
+	for (const auto& value : means)
+	{
+		mean += value;
+	}
+	mean /= static_cast<double>(means.size());
+	M3D covariance = M3D::Zero();
+	for (const auto& value : means)
+	{
+		const V3D difference = value - mean;
+		covariance += difference * difference.transpose();
+	}
+	covariance /= static_cast<double>(means.size() * (means.size() - 1));
+	// Keep the prior positive definite even for an exactly constant sensor.
+	covariance.diagonal().array() += 1e-12;
+	return covariance;
+}
+
+void ImuProcess::InitializeStationary(const deque<sensor_msgs::msg::Imu::ConstSharedPtr>& samples,
+	esekfom::esekf<state_ikfom, 12, input_ikfom>& filter, bool measured_bias_covariance)
+{
+	if (samples.empty())
+	{
+		throw std::invalid_argument("Empty stationary initialization");
+	}
+	Reset();
+	MeasureGroup group;
+	group.imu = samples;
+	group.lidar_beg_time = rclcpp::Time(samples.front()->header.stamp).seconds();
+	group.lidar_end_time = rclcpp::Time(samples.back()->header.stamp).seconds();
+	const M3D bias_covariance = measured_bias_covariance
+		? StationaryGyroMeanCovariance(samples) : M3D::Zero();
+	IMU_init(group, filter, init_iter_num);
+	if (measured_bias_covariance)
+	{
+		auto covariance = filter.get_P();
+		covariance.block<3, 3>(15, 15) = bias_covariance;
+		filter.change_P(covariance);
+		StartupTrace::Get().Event("stationary_gyro_covariance_measured");
+	}
+	cov_acc = cov_acc_scale;
+	cov_gyr = cov_gyr_scale;
+	imu_need_init_ = false;
+	StartupTrace::Get().Event("ground_imu_initialized");
+}
+
+void ImuProcess::AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample)
+{
+	// Only called while independently confirmed disarmed and landed. Do not
+	// integrate ground contact vibration into fictitious position or velocity.
+	last_imu_ = sample;
+	last_lidar_end_time_ = rclcpp::Time(sample->header.stamp).seconds();
+	angvel_last.setZero();
+	acc_s_last.setZero();
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
@@ -238,6 +378,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+	// A group may contain only the previous endpoint. The final extrapolation
+	// still needs a defined input even if every pair in the loop is skipped.
+	const auto& previous_acceleration = last_imu_->linear_acceleration;
+	const auto& previous_gyro = last_imu_->angular_velocity;
+	in.acc = V3D(previous_acceleration.x, previous_acceleration.y, previous_acceleration.z)
+		* G_m_s2 / mean_acc.norm();
+	in.gyro = V3D(previous_gyro.x, previous_gyro.y, previous_gyro.z);
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -341,7 +488,11 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
-  if(meas.imu.empty()) {return;};
+	cur_pcl_un_->clear();
+	if (meas.imu.empty())
+	{
+		return;
+	}
   assert(meas.lidar != nullptr);
 
   if (imu_need_init_)
@@ -362,6 +513,21 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       std::cout << "IMU Initial Done" << std::endl;
+		if (StartupTrace::Get().Active())
+		{
+			std::ostringstream summary;
+			summary << std::setprecision(17) << "init_done," << StartupTrace::Get().GroupId()
+				<< ',' << init_iter_num << ',' << mean_acc.norm() << ',' << G_m_s2 / mean_acc.norm();
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				summary << ',' << mean_acc[axis];
+			}
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				summary << ',' << mean_gyr[axis];
+			}
+			StartupTrace::Get().Event(summary.str());
+		}
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);

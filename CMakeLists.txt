@@ -81,10 +81,12 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
   "msg/Pose6D.msg"
+  "msg/InitializationControl.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  DEPENDENCIES std_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -110,6 +112,15 @@ else()
 endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(startup_filter_test test/startup_filter_test.cpp)
+  target_include_directories(startup_filter_test PRIVATE include src ${PCL_INCLUDE_DIRS})
+  target_link_libraries(startup_filter_test ${PCL_LIBRARIES} Eigen3::Eigen ${cpp_typesupport_target})
+  ament_target_dependencies(startup_filter_test ${dependencies})
+  add_test(NAME startup_filter_test COMMAND startup_filter_test)
+endif()
 
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping

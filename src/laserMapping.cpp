@@ -64,6 +64,11 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_interfaces/msg/custom_msg.hpp>
 #include "preprocess.h"
+#include "group_replay.hpp"
+#include "stationary_window.hpp"
+#include "initialization_control.hpp"
+#include <fast_lio/msg/initialization_control.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
@@ -151,6 +156,73 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+// These checkpoints read state only, including empty scans before map creation.
+void trace_state(const char* stage)
+{
+	if (!StartupTrace::Get().Active())
+	{
+		return;
+	}
+	const state_ikfom state = kf.get_x();
+	const auto covariance = kf.get_P();
+	std::ostringstream record;
+	record << std::setprecision(17) << "state," << StartupTrace::Get().GroupId()
+		<< ',' << stage << ',' << Measures.lidar_beg_time << ',' << Measures.lidar_end_time;
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.pos[axis];
+	}
+	for (int axis = 0; axis < 4; ++axis)
+	{
+		record << ',' << state.rot.coeffs()[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.vel[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.grav[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.bg[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << state.ba[axis];
+	}
+	for (int axis = 0; axis < covariance.rows(); ++axis)
+	{
+		record << ',' << covariance(axis, axis);
+	}
+	StartupTrace::Get().Event(record.str());
+}
+
+void trace_measurement(const Eigen::MatrixXd& jacobian, double residual, bool rematched)
+{
+	if (!StartupTrace::Get().Active())
+	{
+		return;
+	}
+	const Eigen::Matrix<double, 6, 6> information = jacobian.leftCols(6).transpose() * jacobian.leftCols(6);
+	const Eigen::Matrix3d translation_information = information.topLeftCorner<3, 3>();
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> full(information);
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> translation(translation_information);
+	std::ostringstream record;
+	record << std::setprecision(17) << "measurement," << StartupTrace::Get().GroupId()
+		<< ',' << jacobian.rows() << ',' << residual << ',' << rematched;
+	for (int axis = 0; axis < 6; ++axis)
+	{
+		record << ',' << full.eigenvalues()[axis];
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		record << ',' << translation.eigenvalues()[axis];
+	}
+	StartupTrace::Get().Event(record.str());
+}
 
 void SigHandle(int sig)
 {
@@ -327,6 +399,7 @@ void livox_pcl_cbk(const livox_interfaces::msg::CustomMsg::UniquePtr msg)
     const double received = steady_seconds();
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
+	const uint64_t cloud_sequence = StartupTrace::Get().Input(2, *msg);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -360,6 +433,7 @@ void livox_pcl_cbk(const livox_interfaces::msg::CustomMsg::UniquePtr msg)
     timing_buffer.push_back({received, (steady_seconds() - received) * 1000.0});
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
+	StartupTrace::Get().Identify(ptr.get(), cloud_sequence);
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -392,6 +466,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     last_timestamp_imu = timestamp;
 
+	const uint64_t trace_sequence = StartupTrace::Get().Input(1, *msg_in, msg.get());
+	if (StartupTrace::Get().Active())
+	{
+		std::ostringstream record;
+		record << "imu_callback," << trace_sequence << ','
+			<< int64_t(msg_in->header.stamp.sec) * 1000000000 + msg_in->header.stamp.nanosec << ','
+			<< int64_t(msg->header.stamp.sec) * 1000000000 + msg->header.stamp.nanosec;
+		StartupTrace::Get().Event(record.str());
+	}
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -677,8 +760,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     for (int row = 0; row < 6; ++row)
         for (int col = 0; col < 6; ++col)
             odomAftMapped.pose.covariance[row * 6 + col] = pose_cov(row, col);
-    pubOdomAftMapped->publish(odomAftMapped);
 
+    pubOdomAftMapped->publish(odomAftMapped);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "body";
@@ -782,6 +865,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
+		StartupTrace::Get().Event("measurement_empty," + std::to_string(StartupTrace::Get().GroupId()));
         std::cerr << "No Effective Points!" << std::endl;
         // ROS_WARN("No Effective Points! \n");
         return;
@@ -825,6 +909,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+	trace_measurement(ekfom_data.h_x, res_mean_last, ekfom_data.converge);
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -835,6 +920,44 @@ public:
     {
         std::filesystem::create_directories(std::filesystem::path(ROOT_DIR) / "Log");
         std::filesystem::create_directories(std::filesystem::path(ROOT_DIR) / "PCD");
+        this->declare_parameter<std::string>("startup.replay_file", "");
+        this->declare_parameter<bool>("startup.replay_check_point_count", true);
+		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
+		const bool synchronous_map_rebuild = this->declare_parameter<bool>("startup.synchronous_map_rebuild", false);
+		ikdtree.Set_Synchronous_Rebuild(synchronous_map_rebuild);
+		if (synchronous_map_rebuild)
+		{
+			RCLCPP_WARN(this->get_logger(), "Diagnostic synchronous map rebuild enabled; background scheduling removed");
+		}
+		const bool legacy_ground_init = this->declare_parameter<bool>("startup.ground_init", false);
+		stationary_init_ = this->declare_parameter<bool>("startup.stationary_init", false) || legacy_ground_init;
+		if (legacy_ground_init)
+		{
+			RCLCPP_WARN(this->get_logger(), "startup.ground_init is deprecated; use startup.stationary_init with a generic control topic");
+		}
+		initialization_control_topic_ = this->declare_parameter<std::string>("startup.initialization_control_topic", "");
+		permission_.SetTimeout(this->declare_parameter<double>("startup.control_timeout_seconds", 1.0));
+		stationary_.acceleration_scale = this->declare_parameter<double>("startup.acceleration_scale", 1.0);
+		if (!std::isfinite(stationary_.acceleration_scale) || stationary_.acceleration_scale <= 0.0)
+		{
+			throw std::invalid_argument("startup.acceleration_scale must be finite and positive");
+		}
+		measured_bias_covariance_ = this->declare_parameter<bool>("startup.measured_stationary_bias_covariance", false);
+		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
+		if (!std::isfinite(cloud_delay_seconds_) || cloud_delay_seconds_ < 0.0)
+		{
+			throw std::invalid_argument("startup.cloud_delay_seconds must be finite and nonnegative");
+		}
+		if (cloud_delay_seconds_ > 0.0 && !stationary_init_
+			&& this->get_parameter("startup.replay_file").as_string().empty())
+		{
+			throw std::invalid_argument("Cloud delay requires stationary ground initialization");
+		}
+		const int imu_queue_depth = this->declare_parameter<int>("common.imu_queue_depth", 400);
+		if (imu_queue_depth < 1 || imu_queue_depth > 10000)
+		{
+			throw std::invalid_argument("common.imu_queue_depth must be between 1 and 10000");
+		}
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -939,6 +1062,12 @@ public:
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+		if (this->get_parameter("startup.freeze_gyro_bias").as_bool())
+		{
+			kf.set_frozen_vector_block(15, 3);
+			p_imu->set_gyr_bias_cov(V3D::Zero());
+			RCLCPP_WARN(this->get_logger(), "Diagnostic Schmidt gyro-bias freeze enabled; gyro-bias process noise is zero");
+		}
 
         /*** debug record ***/
         // FILE *fp;
@@ -963,7 +1092,27 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+		// SDK1 drains IMU in bursts; ten queued samples cover only 50 ms.
+		sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(),
+			[this](sensor_msgs::msg::Imu::UniquePtr message)
+			{
+				imu_cbk(std::move(message));
+				ObserveStationaryImu();
+			});
+		if (stationary_init_)
+		{
+			startup_pub_ = create_publisher<std_msgs::msg::String>("/lio/startup_phase", rclcpp::QoS(1).transient_local());
+			if (!initialization_control_topic_.empty())
+			{
+				initialization_control_sub_ = create_subscription<fast_lio::msg::InitializationControl>(
+					initialization_control_topic_, rclcpp::QoS(1).reliable(),
+					[this](fast_lio::msg::InitializationControl::ConstSharedPtr message)
+					{
+						permission_.Update(message->state, std::chrono::steady_clock::now());
+					});
+			}
+		}
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -990,13 +1139,188 @@ public:
         fout_out.close();
         fout_pre.close();
         fclose(fp);
+		StartupTrace::Get().Save();
     }
 
+public:
+	bool ReplayIfRequested()
+	{
+		const std::string path = this->get_parameter("startup.replay_file").as_string();
+		if (path.empty())
+		{
+			return false;
+		}
+		replay_mode_ = true;
+		timer_->cancel();
+		map_pub_timer_->cancel();
+		GroupReplay replay(path);
+		if (!replay.GroundImu.empty())
+		{
+			p_imu->InitializeStationary(replay.GroundImu, kf, measured_bias_covariance_);
+			first_lidar_time = get_time_sec(replay.GroundImu.back()->header.stamp);
+			p_imu->first_lidar_time = first_lidar_time;
+			flg_first_scan = false;
+			trace_state("ground_initialized");
+			p_imu->AdvanceStationary(replay.LastGroundImu);
+			cloud_release_stamp_ = get_time_sec(replay.LastGroundImu->header.stamp);
+		}
+		else if (cloud_delay_seconds_ > 0.0)
+		{
+			throw std::invalid_argument("Cloud delay replay requires recorded ground initialization");
+		}
+		const bool check_points = this->get_parameter("startup.replay_check_point_count").as_bool();
+		while (rclcpp::ok() && replay.Next(Measures, *p_pre, check_points))
+		{
+			ProcessCurrentGroup();
+		}
+		return true;
+	}
+
 private:
+	void ClearInitializationBuffers()
+	{
+		imu_buffer.clear();
+		lidar_buffer.clear();
+		time_buffer.clear();
+		timing_buffer.clear();
+		lidar_pushed = false;
+	}
+
+	InitializationPermission::Decision InitializationDecision() const
+	{
+		if (initialization_control_topic_.empty())
+		{
+			return {InitializationPermission::Allowed, true};
+		}
+		return permission_.Read(std::chrono::steady_clock::now());
+	}
+
+	void ReleaseInitialization()
+	{
+		init_released_ = true;
+		cloud_release_stamp_ = init_stamp_;
+		init_phase_ = "IMU_READY_RELEASED";
+		StartupTrace::Get().Event("initialization_release");
+	}
+
+	void ObserveStationaryImu()
+	{
+		if (!stationary_init_ || init_released_ || imu_buffer.empty())
+		{
+			return;
+		}
+		const auto sample = imu_buffer.back();
+		init_imu_time_ = std::chrono::steady_clock::now();
+		const auto decision = InitializationDecision();
+		if (decision.state == InitializationPermission::Aborted
+			|| (init_ready_ && !decision.fresh))
+		{
+			init_failed_ = true;
+			init_phase_ = "FAILED_INITIALIZATION_CONTROL";
+		}
+		if (init_failed_)
+		{
+			ClearInitializationBuffers();
+			return;
+		}
+		if (decision.state == InitializationPermission::Released)
+		{
+			if (init_ready_)
+			{
+				ReleaseInitialization();
+			}
+			else
+			{
+				init_failed_ = true;
+				init_phase_ = "FAILED_RELEASE_BEFORE_INIT";
+				ClearInitializationBuffers();
+			}
+			return;
+		}
+		if (!decision.fresh || decision.state != InitializationPermission::Allowed)
+		{
+			init_phase_ = "WAIT_INITIALIZATION_CONTROL";
+			stationary_.Clear();
+			ClearInitializationBuffers();
+			return;
+		}
+		const bool stationary = stationary_.Append(sample);
+		if (init_ready_ && !stationary)
+		{
+			if (std::string(stationary_.reason) == "motion")
+			{
+				ReleaseInitialization();
+			}
+			else
+			{
+				init_failed_ = true;
+				init_phase_ = "FAILED_IMU_CONTINUITY";
+				ClearInitializationBuffers();
+			}
+			return;
+		}
+		if (!init_ready_ && stationary)
+		{
+			p_imu->InitializeStationary(stationary_.samples, kf, measured_bias_covariance_);
+			init_ready_ = true;
+			flg_first_scan = false;
+			first_lidar_time = get_time_sec(sample->header.stamp);
+			p_imu->first_lidar_time = first_lidar_time;
+			trace_state("stationary_initialized");
+		}
+		init_phase_ = init_ready_ ? "IMU_READY_GROUND" : std::string("COLLECTING_") + stationary_.reason;
+		if (init_ready_)
+		{
+			p_imu->AdvanceStationary(sample);
+			init_stamp_ = get_time_sec(sample->header.stamp);
+			if (initialization_control_topic_.empty())
+			{
+				ReleaseInitialization();
+			}
+		}
+		ClearInitializationBuffers();
+	}
+
     void timer_callback()
     {
+		if (stationary_init_)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			if (now - startup_publish_time_ >= std::chrono::milliseconds(100))
+			{
+				std_msgs::msg::String phase;
+				const auto decision = InitializationDecision();
+				const bool fresh = now - init_imu_time_ < std::chrono::milliseconds(500)
+					&& decision.fresh && decision.state == InitializationPermission::Allowed && !init_failed_;
+				phase.data = init_failed_ || fresh || init_released_ ? init_phase_ : "WAIT_FRESH_INPUT";
+				startup_pub_->publish(phase);
+				startup_publish_time_ = now;
+				if (init_ready_ && !init_released_ && fresh)
+				{
+					state_point = kf.get_x();
+					lidar_end_time = init_stamp_;
+					geoQuat.x = state_point.rot.coeffs()[0];
+					geoQuat.y = state_point.rot.coeffs()[1];
+					geoQuat.z = state_point.rot.coeffs()[2];
+					geoQuat.w = state_point.rot.coeffs()[3];
+					publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+				}
+			}
+			if (!init_released_)
+			{
+				return;
+			}
+		}
         if(sync_packages(Measures))
         {
+			ProcessCurrentGroup();
+		}
+	}
+
+	void ProcessCurrentGroup()
+	{
+			StartupTrace::Get().GroupSelected(Measures);
+			trace_state("before_imu");
             const double processing_start = steady_seconds();
             if (flg_first_scan)
             {
@@ -1016,11 +1340,30 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+			trace_state("after_imu");
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
+			// Keep the original IMU integration boundaries and deskew. Discard
+			// early scans before both map creation and measurement updates;
+			// never enqueue them for processing when the gate opens.
+			if (cloud_delay_seconds_ > 0.0)
+			{
+				if (Measures.lidar_beg_time < cloud_release_stamp_ + cloud_delay_seconds_)
+				{
+					trace_state("cloud_delayed");
+					return;
+				}
+				if (!cloud_delay_opened_)
+				{
+					cloud_delay_opened_ = true;
+					StartupTrace::Get().Event("cloud_delay_opened");
+				}
+			}
+
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
+				trace_state("empty_scan");
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
             }
@@ -1048,6 +1391,8 @@ private:
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
                     ikdtree.Build(feats_down_world->points);
+					trace_state("map_created");
+					init_phase_ = "MAP_READY";
                 }
                 return;
             }
@@ -1088,7 +1433,9 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+			trace_state("before_update");
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+			trace_state("after_update");
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1144,17 +1491,19 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
-            // Milliseconds, monotonic clock; excludes transport before lidar callback.
-            std_msgs::msg::Float64MultiArray performance;
-            performance.data = {
-                (odometry_published - processing_start) * 1000.0,
-                (odometry_published - current_timing.received) * 1000.0,
-                (steady_seconds() - processing_start) * 1000.0,
-                current_timing.preprocess_ms,
-                static_cast<double>(lidar_buffer.size())
-            };
-            pubPerformance_->publish(performance);
-        }
+            if (!replay_mode_)
+            {
+                // Milliseconds, monotonic clock; excludes transport before lidar callback.
+                std_msgs::msg::Float64MultiArray performance;
+                performance.data = {
+                    (odometry_published - processing_start) * 1000.0,
+                    (odometry_published - current_timing.received) * 1000.0,
+                    (steady_seconds() - processing_start) * 1000.0,
+                    current_timing.preprocess_ms,
+                    static_cast<double>(lidar_buffer.size())
+                };
+                pubPerformance_->publish(performance);
+            }
     }
 
     void map_publish_callback()
@@ -1183,6 +1532,23 @@ private:
     }
 
 private:
+	bool stationary_init_ = false;
+	bool measured_bias_covariance_ = false;
+	bool init_ready_ = false;
+	bool init_released_ = false;
+	bool init_failed_ = false;
+	double init_stamp_ = 0.0;
+	double cloud_delay_seconds_ = 0.0;
+	double cloud_release_stamp_ = 0.0;
+	bool cloud_delay_opened_ = false;
+	std::string init_phase_ = "WAIT_LANDED_DISARMED";
+	StationaryWindow stationary_;
+	InitializationPermission permission_;
+	std::string initialization_control_topic_;
+	bool replay_mode_ = false;
+	std::chrono::steady_clock::time_point init_imu_time_, startup_publish_time_;
+	rclcpp::Publisher<std_msgs::msg::String>::SharedPtr startup_pub_;
+	rclcpp::Subscription<fast_lio::msg::InitializationControl>::SharedPtr initialization_control_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
@@ -1215,7 +1581,12 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+	auto node = std::make_shared<LaserMappingNode>();
+	if (!node->ReplayIfRequested())
+	{
+		rclcpp::spin(node);
+	}
+	node.reset();
 
     if (rclcpp::ok())
         rclcpp::shutdown();
