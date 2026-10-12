@@ -239,5 +239,6 @@ fabricated callback latency. The original mapping/deskew equations, dated
 PCD saving and corrected ROS pose covariance are retained.
 
 Build with `-DBUILD_TESTING=ON` and run `ctest --test-dir <build/fast_lio>`
-to check prediction/reset boundaries, stationary initialization, covariance,
+after sourcing ROS and the workspace install environment, to check
+prediction/reset boundaries, stationary initialization, covariance,
 SDK1 acceleration units and authorization expiry.

@@ -1110,6 +1110,18 @@ public:
 					[this](fast_lio::msg::InitializationControl::ConstSharedPtr message)
 					{
 						permission_.Update(message->state, std::chrono::steady_clock::now());
+						// Failure commands must take effect even before the first IMU.
+						if (!init_released_ && message->state >= fast_lio::msg::InitializationControl::ABORTED)
+						{
+							init_failed_ = true;
+							init_phase_ = "FAILED_INITIALIZATION_CONTROL";
+						}
+						else if (!init_released_ && !init_ready_
+							&& message->state == fast_lio::msg::InitializationControl::RELEASED)
+						{
+							init_failed_ = true;
+							init_phase_ = "FAILED_RELEASE_BEFORE_INIT";
+						}
 					});
 			}
 		}
