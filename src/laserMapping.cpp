@@ -67,6 +67,9 @@
 #include "group_replay.hpp"
 #include "stationary_window.hpp"
 #include "initialization_control.hpp"
+#include "cloud_permission.hpp"
+#include <fast_lio/msg/cloud_control.hpp>
+#include <fast_lio/msg/localization_status.hpp>
 #include <fast_lio/msg/initialization_control.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <ikd-Tree/ikd_Tree.h>
@@ -96,6 +99,7 @@ string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
+double translation_condition_ratio = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
@@ -909,6 +913,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+    const auto translation_jacobian = ekfom_data.h_x.leftCols(3).eval();
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> information_solver(
+        translation_jacobian.transpose() * translation_jacobian);
+    const auto eigenvalues = information_solver.eigenvalues();
+    translation_condition_ratio = eigenvalues[2] > 0 ? eigenvalues[0] / eigenvalues[2] : 0;
 	trace_measurement(ekfom_data.h_x, res_mean_last, ekfom_data.converge);
     solve_time += omp_get_wtime() - solve_start_;
 }
@@ -943,7 +952,18 @@ public:
 			throw std::invalid_argument("startup.acceleration_scale must be finite and positive");
 		}
 		measured_bias_covariance_ = this->declare_parameter<bool>("startup.measured_stationary_bias_covariance", false);
+        cloud_control_topic_ = this->declare_parameter<std::string>("startup.cloud_control_topic", "");
+        cloud_permission_.SetTimeout(this->declare_parameter<double>("startup.cloud_control_timeout_seconds", 0.5));
+        if (!cloud_control_topic_.empty()) {
+            cloud_control_sub_ = this->create_subscription<fast_lio::msg::CloudControl>(
+                cloud_control_topic_, 10, [this](fast_lio::msg::CloudControl::ConstSharedPtr msg) {
+                    cloud_permission_.Update(msg->session_id, msg->sequence, msg->enabled,
+                                             std::chrono::steady_clock::now());
+                });
+        }
+        localization_status_pub_ = this->create_publisher<fast_lio::msg::LocalizationStatus>("/lio/localization_status", 10);
 		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
+        if (!cloud_control_topic_.empty()) cloud_delay_seconds_ = 0.0;
 		if (!std::isfinite(cloud_delay_seconds_) || cloud_delay_seconds_ < 0.0)
 		{
 			throw std::invalid_argument("startup.cloud_delay_seconds must be finite and nonnegative");
@@ -1293,8 +1313,26 @@ private:
 		ClearInitializationBuffers();
 	}
 
+    void PublishLocalizationStatus()
+    {
+        const auto status_now = std::chrono::steady_clock::now();
+        if (status_now - status_publish_time_ < std::chrono::milliseconds(100)) return;
+        status_publish_time_ = status_now;
+        fast_lio::msg::LocalizationStatus msg;
+        msg.header.stamp = get_ros_time(init_released_ ? lidar_end_time : init_stamp_);
+        msg.phase = init_phase_;
+        msg.corrections_enabled = cloud_control_topic_.empty() || cloud_permission_.Enabled(std::chrono::steady_clock::now());
+        msg.correction_sequence = correction_sequence_;
+        msg.last_correction_time = last_correction_time_;
+        msg.effective_points = effct_feat_num;
+        msg.mean_residual_m = res_mean_last;
+        msg.translation_condition_ratio = translation_condition_ratio;
+        localization_status_pub_->publish(msg);
+    }
+
     void timer_callback()
     {
+        PublishLocalizationStatus();
 		if (stationary_init_)
 		{
 			const auto now = std::chrono::steady_clock::now();
@@ -1355,6 +1393,16 @@ private:
 			trace_state("after_imu");
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            if (!cloud_control_topic_.empty() && !cloud_permission_.Enabled(std::chrono::steady_clock::now())) {
+                // Preserve propagation and timestamps; report its limited quality explicitly.
+                geoQuat.x = state_point.rot.coeffs()[0];
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+                init_phase_ = "INERTIAL_ONLY";
+                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+                return;
+            }
 
 			// Keep the original IMU integration boundaries and deskew. Discard
 			// early scans before both map creation and measurement updates;
@@ -1458,6 +1506,11 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            if (effct_feat_num > 5 && std::isfinite(res_mean_last)) {
+                last_correction_time_ = lidar_end_time;
+                ++correction_sequence_;
+                init_phase_ = "MAP_READY";
+            }
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
             const double odometry_published = steady_seconds();
@@ -1544,6 +1597,13 @@ private:
     }
 
 private:
+    std::chrono::steady_clock::time_point status_publish_time_{};
+    CloudPermission cloud_permission_;
+    std::string cloud_control_topic_;
+    uint64_t correction_sequence_ = 0;
+    double last_correction_time_ = 0.0;
+    rclcpp::Subscription<fast_lio::msg::CloudControl>::SharedPtr cloud_control_sub_;
+    rclcpp::Publisher<fast_lio::msg::LocalizationStatus>::SharedPtr localization_status_pub_;
 	bool stationary_init_ = false;
 	bool measured_bias_covariance_ = false;
 	bool init_ready_ = false;
