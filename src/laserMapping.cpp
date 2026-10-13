@@ -957,8 +957,11 @@ public:
         if (!cloud_control_topic_.empty()) {
             cloud_control_sub_ = this->create_subscription<fast_lio::msg::CloudControl>(
                 cloud_control_topic_, 10, [this](fast_lio::msg::CloudControl::ConstSharedPtr msg) {
+                    const auto stamp = rclcpp::Time(msg->header.stamp);
+                    if (stamp.nanoseconds() <= 0) return;
+                    const double age = (this->get_clock()->now() - stamp).seconds();
                     cloud_permission_.Update(msg->session_id, msg->sequence, msg->enabled,
-                                             std::chrono::steady_clock::now());
+                                             std::chrono::steady_clock::now(), age);
                 });
         }
         localization_status_pub_ = this->create_publisher<fast_lio::msg::LocalizationStatus>("/lio/localization_status", 10);

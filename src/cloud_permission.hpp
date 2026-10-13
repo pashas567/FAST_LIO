@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -19,14 +20,17 @@ public:
         timeout_ = std::chrono::duration<double>(timeout);
     }
     bool Update(const std::string& session, uint64_t sequence, bool enabled,
-                Clock::time_point now)
+                Clock::time_point now, double stamp_age = 0.0)
     {
+        if (!std::isfinite(stamp_age) || stamp_age < -0.1 || stamp_age > timeout_.count())
+            return false;
         if (session.empty() || (has_update_ && (session != session_ || sequence <= sequence_)))
             return false;
         session_ = session;
         sequence_ = sequence;
         enabled_ = enabled;
-        received_ = now;
+        received_ = now - std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(std::max(0.0, stamp_age)));
         has_update_ = true;
         return true;
     }
