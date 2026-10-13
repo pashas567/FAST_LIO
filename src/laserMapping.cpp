@@ -1370,6 +1370,19 @@ private:
 		}
 	}
 
+    void PublishInertialOdometry()
+    {
+        geoQuat.x = state_point.rot.coeffs()[0];
+        geoQuat.y = state_point.rot.coeffs()[1];
+        geoQuat.z = state_point.rot.coeffs()[2];
+        geoQuat.w = state_point.rot.coeffs()[3];
+        init_phase_ = "INERTIAL_ONLY";
+        effct_feat_num = 0;
+        res_mean_last = 0.0;
+        translation_condition_ratio = 0.0;
+        publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+    }
+
 	void ProcessCurrentGroup()
 	{
 			StartupTrace::Get().GroupSelected(Measures);
@@ -1398,12 +1411,7 @@ private:
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             if (!cloud_control_topic_.empty() && !cloud_permission_.Enabled(std::chrono::steady_clock::now())) {
                 // Preserve propagation and timestamps; report its limited quality explicitly.
-                geoQuat.x = state_point.rot.coeffs()[0];
-                geoQuat.y = state_point.rot.coeffs()[1];
-                geoQuat.z = state_point.rot.coeffs()[2];
-                geoQuat.w = state_point.rot.coeffs()[3];
-                init_phase_ = "INERTIAL_ONLY";
-                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+                PublishInertialOdometry();
                 return;
             }
 
@@ -1424,10 +1432,15 @@ private:
 				}
 			}
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            if (!feats_undistort || feats_undistort->empty())
             {
 				trace_state("empty_scan");
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                if (!cloud_control_topic_.empty()) {
+                    // An absent cloud is not a corrected estimate. Keep the
+                    // IMU trajectory available for diagnostics on last meters.
+                    PublishInertialOdometry();
+                }
                 return;
             }
 
