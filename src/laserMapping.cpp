@@ -1336,7 +1336,7 @@ private:
 		if (stationary_init_)
 		{
 			const auto now = std::chrono::steady_clock::now();
-			if (now - startup_publish_time_ >= std::chrono::milliseconds(100))
+			if (now - startup_publish_time_ >= std::chrono::milliseconds(50))
 			{
 				std_msgs::msg::String phase;
 				const auto decision = InitializationDecision();
