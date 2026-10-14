@@ -221,8 +221,17 @@ seconds of stationary IMU. Without `startup.initialization_control_topic`
 it releases automatically after calibration; with a topic it requires fresh
 ALLOWED messages, then RELEASED to leave the stationary hold. ABORTED,
 release before calibration, or authorization expiry after calibration require
-restarting initialization. Detected motion after calibration also releases
-the hold; IMU discontinuities are failures rather than permission to continue.
+restarting initialization. Without an external control topic, detected motion
+after calibration releases the hold. With external control, motion cannot
+replace RELEASED: it fails initialization by default. IMU discontinuities
+are failures rather than permission to continue.
+
+`startup.retry_ground_motion=true` optionally restarts stationary collection
+after motion while fresh external ALLOWED authorization is present. During
+COLLECTING_GROUND_RETRY it clears queued measurements and publishes no
+odometry until another continuous stationary interval is collected. The
+external controller must confirm disarm/ground preparation and handle any
+ground frame anchor; this option never reinitializes a released filter.
 
 The interface commands are BLOCKED=0, ALLOWED=1, RELEASED=2, ABORTED=3.
 The default authorization timeout is one second. `startup.acceleration_scale`

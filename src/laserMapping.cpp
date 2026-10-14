@@ -940,6 +940,7 @@ public:
 		}
 		const bool legacy_ground_init = this->declare_parameter<bool>("startup.ground_init", false);
 		stationary_init_ = this->declare_parameter<bool>("startup.stationary_init", false) || legacy_ground_init;
+		retry_ground_motion_ = this->declare_parameter<bool>("startup.retry_ground_motion", false);
 		if (legacy_ground_init)
 		{
 			RCLCPP_WARN(this->get_logger(), "startup.ground_init is deprecated; use startup.stationary_init with a generic control topic");
@@ -1134,7 +1135,7 @@ public:
 					{
 						permission_.Update(message->state, std::chrono::steady_clock::now());
 						// Failure commands must take effect even before the first IMU.
-						if (!init_released_ && message->state >= fast_lio::msg::InitializationControl::ABORTED)
+						if (!init_failed_ && !init_released_ && message->state >= fast_lio::msg::InitializationControl::ABORTED)
 						{
 							init_failed_ = true;
 							init_phase_ = "FAILED_INITIALIZATION_CONTROL";
@@ -1288,6 +1289,17 @@ private:
 				{
 					ReleaseInitialization();
 				}
+				else if (retry_ground_motion_)
+				{
+					// ALLOWED is the external controller's fresh confirmation of
+					// stationary preparation on the ground, never permission to fly.
+					init_ready_ = false;
+					ground_retry_pending_ = true;
+					stationary_.Clear();
+					ClearInitializationBuffers();
+					init_phase_ = "COLLECTING_GROUND_RETRY";
+					StartupTrace::Get().Event("ground_stationary_retry");
+				}
 				else
 				{
 					init_failed_ = true;
@@ -1310,12 +1322,14 @@ private:
 		{
 			p_imu->InitializeStationary(stationary_.samples, kf, measured_bias_covariance_);
 			init_ready_ = true;
+			ground_retry_pending_ = false;
 			flg_first_scan = false;
 			first_lidar_time = get_time_sec(sample->header.stamp);
 			p_imu->first_lidar_time = first_lidar_time;
 			trace_state("stationary_initialized");
 		}
-		init_phase_ = init_ready_ ? "IMU_READY_GROUND" : std::string("COLLECTING_") + stationary_.reason;
+		init_phase_ = init_ready_ ? "IMU_READY_GROUND"
+			: (ground_retry_pending_ ? "COLLECTING_GROUND_RETRY" : std::string("COLLECTING_") + stationary_.reason);
 		if (init_ready_)
 		{
 			p_imu->AdvanceStationary(sample);
@@ -1633,6 +1647,8 @@ private:
     rclcpp::Subscription<fast_lio::msg::CloudControl>::SharedPtr cloud_control_sub_;
     rclcpp::Publisher<fast_lio::msg::LocalizationStatus>::SharedPtr localization_status_pub_;
 	bool stationary_init_ = false;
+	bool retry_ground_motion_ = false;
+	bool ground_retry_pending_ = false;
 	bool measured_bias_covariance_ = false;
 	bool init_ready_ = false;
 	bool init_released_ = false;
