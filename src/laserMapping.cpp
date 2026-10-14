@@ -1247,8 +1247,8 @@ private:
 		const auto sample = imu_buffer.back();
 		init_imu_time_ = std::chrono::steady_clock::now();
 		const auto decision = InitializationDecision();
-		if (decision.state == InitializationPermission::Aborted
-			|| (init_ready_ && !decision.fresh))
+		if (!init_failed_ && (decision.state == InitializationPermission::Aborted
+			|| (init_ready_ && !decision.fresh)))
 		{
 			init_failed_ = true;
 			init_phase_ = "FAILED_INITIALIZATION_CONTROL";
@@ -1284,7 +1284,19 @@ private:
 		{
 			if (std::string(stationary_.reason) == "motion")
 			{
-				ReleaseInitialization();
+				if (initialization_control_topic_.empty())
+				{
+					ReleaseInitialization();
+				}
+				else
+				{
+					init_failed_ = true;
+					init_phase_ = "FAILED_GROUND_MOTION";
+					StartupTrace::Get().Event("ground_motion_before_release");
+					RCLCPP_ERROR(this->get_logger(),
+						"Ground IMU is no longer stationary; external initialization release is required. Restart preparation on stable ground.");
+					ClearInitializationBuffers();
+				}
 			}
 			else
 			{
