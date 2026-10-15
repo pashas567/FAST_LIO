@@ -1,0 +1,5 @@
+# Reset only under a fresh ALLOWED initialization lease for this session.
+string session_id
+---
+bool success
+string message

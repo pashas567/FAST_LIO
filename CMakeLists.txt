@@ -84,11 +84,13 @@ set(msg_files
   "msg/InitializationControl.msg"
   "msg/CloudControl.msg"
   "msg/LocalizationStatus.msg"
+  "msg/SessionOdometry.msg"
+  "srv/ResetSession.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
-  DEPENDENCIES std_msgs
+  DEPENDENCIES std_msgs nav_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -122,6 +124,10 @@ if(BUILD_TESTING)
   target_link_libraries(startup_filter_test ${PCL_LIBRARIES} Eigen3::Eigen ${cpp_typesupport_target})
   ament_target_dependencies(startup_filter_test ${dependencies})
   add_test(NAME startup_filter_test COMMAND startup_filter_test)
+  add_executable(session_map_test test/session_map_test.cpp include/ikd-Tree/ikd_Tree.cpp)
+  target_include_directories(session_map_test PRIVATE include ${PCL_INCLUDE_DIRS})
+  target_link_libraries(session_map_test ${PCL_LIBRARIES} Eigen3::Eigen)
+  add_test(NAME session_map_test COMMAND session_map_test)
 endif()
 
 # ---------------- Install --------------- #

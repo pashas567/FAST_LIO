@@ -6,3 +6,5 @@ float64 last_correction_time
 uint32 effective_points
 float64 mean_residual_m
 float64 translation_condition_ratio
+
+string session_id

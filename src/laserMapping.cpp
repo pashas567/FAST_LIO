@@ -69,6 +69,8 @@
 #include "initialization_control.hpp"
 #include "cloud_permission.hpp"
 #include <fast_lio/msg/cloud_control.hpp>
+#include <fast_lio/msg/session_odometry.hpp>
+#include <fast_lio/srv/reset_session.hpp>
 #include <fast_lio/msg/localization_status.hpp>
 #include <fast_lio/msg/initialization_control.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -100,6 +102,7 @@ string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double translation_condition_ratio = 0.0;
+double session_input_cutoff_s = -std::numeric_limits<double>::infinity();
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
@@ -138,7 +141,7 @@ PointCloudXYZI::Ptr _featsArray;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
-KD_TREE<PointType> ikdtree;
+std::unique_ptr<KD_TREE<PointType>> ikdtree = std::make_unique<KD_TREE<PointType>>();
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -311,7 +314,7 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 void points_cache_collect()
 {
     PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
+    ikdtree->acquire_removed_points(points_history);
     // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
@@ -361,12 +364,13 @@ void lasermap_fov_segment()
 
     points_cache_collect();
     double delete_begin = omp_get_wtime();
-    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
+    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree->Delete_Point_Boxes(cub_needrm);
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    if (get_time_sec(msg->header.stamp) <= session_input_cutoff_s) return;
     const double received = steady_seconds();
     mtx_buffer.lock();
     scan_count ++;
@@ -400,6 +404,7 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_interfaces::msg::CustomMsg::UniquePtr msg)
 {
+    if (get_time_sec(msg->header.stamp) <= session_input_cutoff_s) return;
     const double received = steady_seconds();
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
@@ -446,6 +451,7 @@ void livox_pcl_cbk(const livox_interfaces::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    if (get_time_sec(msg_in->header.stamp) <= session_input_cutoff_s) return;
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -586,8 +592,8 @@ void map_incremental()
     }
 
     double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
+    add_point_size = ikdtree->Add_Points(PointToAdd, true);
+    ikdtree->Add_Points(PointNoNeedDownsample, false);
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
@@ -686,10 +692,10 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
+double last_saved_scan_time = -1.0;
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
     // A 1 Hz timer must not accumulate the same scan during a sensor outage.
-    static double last_saved_scan_time = -1.0;
     if (feats_undistort->empty() || lidar_end_time == last_saved_scan_time) return;
     last_saved_scan_time = lidar_end_time;
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
@@ -731,7 +737,24 @@ string save_to_pcd()
     const std::filesystem::path base(map_file_path);
     const auto destination = base.parent_path() / (base.stem().string() + suffix.str() + base.extension().string());
     pcl::PCDWriter pcd_writer;
-    if (pcd_writer.writeBinary(destination.string(), *pcl_wait_pub) != 0)
+    PointCloudXYZI snapshot;
+    snapshot.points = ikdtree->Snapshot();
+    if (snapshot.empty())
+    {
+        // An aborted takeoff may never have produced a map. Preserve an explicit
+        // empty PCD so its recording is complete and ground recovery can proceed.
+        std::ofstream empty(destination);
+        empty << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\n"
+              << "FIELDS x y z intensity\nSIZE 4 4 4 4\nTYPE F F F F\n"
+              << "COUNT 1 1 1 1\nWIDTH 0\nHEIGHT 1\n"
+              << "VIEWPOINT 0 0 0 1 0 0 0\nPOINTS 0\nDATA ascii\n";
+        empty.close();
+        if (!empty) throw std::runtime_error("Empty PCD write failed: " + destination.string());
+        return destination.string();
+    }
+    snapshot.width = snapshot.points.size();
+    snapshot.height = 1;
+    if (pcd_writer.writeBinary(destination.string(), snapshot) != 0)
         throw std::runtime_error("PCD write failed: " + destination.string());
     return destination.string();
 }
@@ -828,7 +851,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (ekfom_data.converge)
         {
             /** Find the closest surfaces in the map **/
-            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+            ikdtree->Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
         }
 
@@ -932,9 +955,9 @@ public:
         this->declare_parameter<std::string>("startup.replay_file", "");
         this->declare_parameter<bool>("startup.replay_check_point_count", true);
 		this->declare_parameter<bool>("startup.freeze_gyro_bias", false);
-		const bool synchronous_map_rebuild = this->declare_parameter<bool>("startup.synchronous_map_rebuild", false);
-		ikdtree.Set_Synchronous_Rebuild(synchronous_map_rebuild);
-		if (synchronous_map_rebuild)
+		synchronous_map_rebuild_ = this->declare_parameter<bool>("startup.synchronous_map_rebuild", false);
+		ikdtree->Set_Synchronous_Rebuild(synchronous_map_rebuild_);
+		if (synchronous_map_rebuild_)
 		{
 			RCLCPP_WARN(this->get_logger(), "Diagnostic synchronous map rebuild enabled; background scheduling removed");
 		}
@@ -1133,7 +1156,13 @@ public:
 					initialization_control_topic_, rclcpp::QoS(1).reliable(),
 					[this](fast_lio::msg::InitializationControl::ConstSharedPtr message)
 					{
-						permission_.Update(message->state, std::chrono::steady_clock::now());
+						const auto stamp = rclcpp::Time(message->header.stamp);
+                        const double age = (this->now() - stamp).seconds();
+                        if (stamp.nanoseconds() <= control_stamp_ns_ || age < -0.1 || age > 0.5) return;
+                        control_stamp_ns_ = stamp.nanoseconds();
+                        control_session_ = message->session_id;
+                        permission_.Update(message->state, std::chrono::steady_clock::now());
+                        if (message->session_id != session_id_) return;
 						// Failure commands must take effect even before the first IMU.
 						if (!init_failed_ && !init_released_ && message->state >= fast_lio::msg::InitializationControl::ABORTED)
 						{
@@ -1165,6 +1194,12 @@ public:
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
+        session_odometry_pub_ = create_publisher<fast_lio::msg::SessionOdometry>("/lio/session_odometry", 30);
+        reset_session_srv_ = create_service<fast_lio::srv::ResetSession>(
+            "/lio/reset_session", [this](fast_lio::srv::ResetSession::Request::ConstSharedPtr request,
+                                        fast_lio::srv::ResetSession::Response::SharedPtr response) {
+                ResetSession(*request, *response);
+            });
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
@@ -1213,6 +1248,104 @@ public:
 	}
 
 private:
+    void PublishSessionOdometry()
+    {
+        publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+        fast_lio::msg::SessionOdometry message;
+        message.session_id = session_id_;
+        message.phase = init_phase_;
+        message.odometry = odomAftMapped;
+        session_odometry_pub_->publish(message);
+    }
+
+    void ResetSession(const fast_lio::srv::ResetSession::Request& request,
+                      fast_lio::srv::ResetSession::Response& response)
+    {
+        const auto permission = permission_.Read(std::chrono::steady_clock::now());
+        if (initialization_control_topic_.empty() || !stationary_init_
+            || !permission.fresh || permission.state != InitializationPermission::Allowed
+            || request.session_id.empty() || control_session_ != request.session_id)
+        {
+            response.message = "Fresh ground initialization permission for requested session required";
+            return;
+        }
+        if (request.session_id == session_id_)
+        {
+            response.success = true;
+            response.message = "Session already active; no reset performed";
+            return;
+        }
+        // The default mutually exclusive callback group runs this between scans.
+        // Destroying the tree joins its rebuild worker before freeing map nodes.
+        ikdtree.reset();
+        ikdtree = std::make_unique<KD_TREE<PointType>>();
+        ikdtree->Set_Synchronous_Rebuild(synchronous_map_rebuild_);
+        ResetEstimator();
+        ResetScanState();
+        session_id_ = request.session_id;
+        cloud_permission_.BindSession(session_id_);
+        response.success = true;
+        response.message = session_id_;
+        RCLCPP_INFO(get_logger(), "Localization session reset: %s", session_id_.c_str());
+    }
+
+    void ResetEstimator()
+    {
+        kf = decltype(kf)();
+        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+        p_imu = std::make_shared<ImuProcess>();
+        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
+        p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
+        p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+        p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+        if (get_parameter("startup.freeze_gyro_bias").as_bool())
+        {
+            kf.set_frozen_vector_block(15, 3);
+            p_imu->set_gyr_bias_cov(V3D::Zero());
+        }
+        state_point = state_ikfom();
+        stationary_.Clear();
+        init_ready_ = init_released_ = init_failed_ = ground_retry_pending_ = false;
+        init_stamp_ = cloud_release_stamp_ = 0.0;
+        cloud_delay_opened_ = false;
+        correction_sequence_ = 0;
+        last_correction_time_ = 0.0;
+        init_phase_ = "COLLECTING_NEW_SESSION";
+    }
+
+    void ResetScanState()
+    {
+        session_input_cutoff_s = std::max(last_timestamp_imu, last_timestamp_lidar);
+        ClearInitializationBuffers();
+        Measures = MeasureGroup();
+        featsFromMap->clear();
+        feats_undistort->clear();
+        feats_down_body->clear();
+        feats_down_world->clear();
+        pcl_wait_pub->clear();
+        pcl_wait_save->clear();
+        _featsArray->clear();
+        Nearest_Points.clear();
+        pointSearchInd_surf.clear();
+        cub_needrm.clear();
+        Localmap_Initialized = false;
+        LocalMap_Points = BoxPointType();
+        flg_first_scan = true;
+        flg_EKF_inited = false;
+        first_lidar_time = lidar_end_time = lidar_mean_scantime = 0.0;
+        scan_count = scan_num = time_log_counter = publish_count = 0;
+        effct_feat_num = feats_down_size = laserCloudValidNum = 0;
+        res_mean_last = total_residual = translation_condition_ratio = 0.0;
+        position_last.setZero();
+        total_distance = 0.0;
+        last_saved_scan_time = -1.0;
+        path.poses.clear();
+        odomAftMapped = nav_msgs::msg::Odometry();
+        memset(point_selected_surf, true, sizeof(point_selected_surf));
+        memset(res_last, -1000.0f, sizeof(res_last));
+    }
+
 	void ClearInitializationBuffers()
 	{
 		imu_buffer.clear();
@@ -1228,7 +1361,8 @@ private:
 		{
 			return {InitializationPermission::Allowed, true};
 		}
-		return permission_.Read(std::chrono::steady_clock::now());
+		if (control_session_ != session_id_) return {InitializationPermission::Blocked, false};
+        return permission_.Read(std::chrono::steady_clock::now());
 	}
 
 	void ReleaseInitialization()
@@ -1349,6 +1483,7 @@ private:
         status_publish_time_ = status_now;
         fast_lio::msg::LocalizationStatus msg;
         msg.header.stamp = get_ros_time(init_released_ ? lidar_end_time : init_stamp_);
+        msg.session_id = session_id_;
         msg.phase = init_phase_;
         msg.corrections_enabled = cloud_control_topic_.empty() || cloud_permission_.Enabled(std::chrono::steady_clock::now());
         msg.correction_sequence = correction_sequence_;
@@ -1382,7 +1517,7 @@ private:
 					geoQuat.y = state_point.rot.coeffs()[1];
 					geoQuat.z = state_point.rot.coeffs()[2];
 					geoQuat.w = state_point.rot.coeffs()[3];
-					publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+					PublishSessionOdometry();
 				}
 			}
 			if (!init_released_)
@@ -1406,7 +1541,7 @@ private:
         effct_feat_num = 0;
         res_mean_last = 0.0;
         translation_condition_ratio = 0.0;
-        publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+        PublishSessionOdometry();
     }
 
 	void ProcessCurrentGroup()
@@ -1481,25 +1616,25 @@ private:
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            if(ikdtree->Root_Node == nullptr)
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
-                    ikdtree.set_downsample_param(filter_size_map_min);
+                    ikdtree->set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
                     for(int i = 0; i < feats_down_size; i++)
                     {
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
-                    ikdtree.Build(feats_down_world->points);
+                    ikdtree->Build(feats_down_world->points);
 					trace_state("map_created");
 					init_phase_ = "MAP_READY";
                 }
                 return;
             }
-            int featsFromMapNum = ikdtree.validnum();
-            kdtree_size_st = ikdtree.size();
+            int featsFromMapNum = ikdtree->validnum();
+            kdtree_size_st = ikdtree->size();
             
             // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
@@ -1519,10 +1654,10 @@ private:
 
             if(0) // If you need to see map point, change to "if(1)"
             {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                PointVector ().swap(ikdtree->PCL_Storage);
+                ikdtree->flatten(ikdtree->Root_Node, ikdtree->PCL_Storage, NOT_RECORD);
                 featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
+                featsFromMap->points = ikdtree->PCL_Storage;
             }
 
             pointSearchInd_surf.resize(feats_down_size);
@@ -1554,7 +1689,7 @@ private:
                 init_phase_ = "MAP_READY";
             }
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            PublishSessionOdometry();
             const double odometry_published = steady_seconds();
 
             /*** add the feature points to map kdtree ***/
@@ -1573,7 +1708,7 @@ private:
             if (runtime_pos_log)
             {
                 frame_num ++;
-                kdtree_size_end = ikdtree.size();
+                kdtree_size_end = ikdtree->size();
                 aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
                 aver_time_icp = aver_time_icp * (frame_num - 1)/frame_num + (t_update_end - t_update_start) / frame_num;
                 aver_time_match = aver_time_match * (frame_num - 1)/frame_num + (match_time)/frame_num;
@@ -1639,6 +1774,11 @@ private:
     }
 
 private:
+    std::string session_id_, control_session_;
+    int64_t control_stamp_ns_ = 0;
+    bool synchronous_map_rebuild_ = false;
+    rclcpp::Service<fast_lio::srv::ResetSession>::SharedPtr reset_session_srv_;
+    rclcpp::Publisher<fast_lio::msg::SessionOdometry>::SharedPtr session_odometry_pub_;
     std::chrono::steady_clock::time_point status_publish_time_{};
     CloudPermission cloud_permission_;
     std::string cloud_control_topic_;

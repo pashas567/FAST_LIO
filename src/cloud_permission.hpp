@@ -19,12 +19,19 @@ public:
             throw std::invalid_argument("Cloud authorization timeout must be positive");
         timeout_ = std::chrono::duration<double>(timeout);
     }
+    void BindSession(const std::string& session)
+    {
+        session_ = session;
+        sequence_ = 0;
+        enabled_ = has_update_ = false;
+        bound_ = true;
+    }
     bool Update(const std::string& session, uint64_t sequence, bool enabled,
                 Clock::time_point now, double stamp_age = 0.0)
     {
         if (!std::isfinite(stamp_age) || stamp_age < -0.1 || stamp_age > timeout_.count())
             return false;
-        if (session.empty() || (has_update_ && (session != session_ || sequence <= sequence_)))
+        if (session.empty() || (bound_ && session != session_) || (has_update_ && (session != session_ || sequence <= sequence_)))
             return false;
         session_ = session;
         sequence_ = sequence;
@@ -41,7 +48,7 @@ public:
 private:
     std::string session_;
     uint64_t sequence_ = 0;
-    bool enabled_ = false, has_update_ = false;
+    bool enabled_ = false, has_update_ = false, bound_ = false;
     Clock::time_point received_{};
     std::chrono::duration<double> timeout_{0.5};
 };

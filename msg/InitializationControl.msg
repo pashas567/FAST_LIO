@@ -7,3 +7,5 @@ uint8 ABORTED=3
 std_msgs/Header header
 uint8 state
 string reason
+
+string session_id
