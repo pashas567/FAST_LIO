@@ -63,6 +63,7 @@
 #include "preprocess.h"
 #include "group_replay.hpp"
 #include "stationary_window.hpp"
+#include "imu_prediction_state.hpp"
 #include <mavros_msgs/msg/state.hpp>
 #include <mavros_msgs/msg/extended_state.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -892,6 +893,11 @@ public:
 		{
 			RCLCPP_WARN(this->get_logger(), "Diagnostic synchronous map rebuild enabled; background scheduling removed");
 		}
+		prediction_enabled_ = this->declare_parameter<bool>("prediction.enabled", false);
+		if (prediction_enabled_) {
+			prediction_session_ = std::to_string(getpid()) + "-" +
+				std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+		}
 		ground_init_ = this->declare_parameter<bool>("startup.ground_init", false);
 		measured_bias_covariance_ = this->declare_parameter<bool>("startup.measured_stationary_bias_covariance", false);
 		cloud_delay_seconds_ = this->declare_parameter<double>("startup.cloud_delay_seconds", 0.0);
@@ -1048,6 +1054,19 @@ public:
 			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(),
 			[this](sensor_msgs::msg::Imu::UniquePtr message)
 			{
+				if (prediction_enabled_) {
+					CheckPredictionClock();
+					const int64_t raw_stamp = fastlio_prediction::stampNs(message->header.stamp);
+					if (prediction_last_raw_imu_ns_ >= 0 && raw_stamp < prediction_last_raw_imu_ns_) {
+						if (prediction_last_raw_imu_ns_ - raw_stamp >= 1000000000LL) {
+							InvalidatePrediction("IMU_SOURCE_TIME_REWIND");
+						}
+						RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+							"Dropping out-of-order IMU for prediction-enabled mapper");
+						return;
+					}
+					prediction_last_raw_imu_ns_ = raw_stamp;
+				}
 				imu_cbk(std::move(message));
 				ObserveGroundImu();
 			});
@@ -1074,6 +1093,11 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+		if (prediction_enabled_) {
+			prediction_pub_ = create_publisher<fast_lio::msg::FilterState>(
+				"/lio/filter_state", rclcpp::QoS(20).reliable().transient_local());
+			PublishPredictionState();
+		}
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1129,6 +1153,66 @@ public:
 	}
 
 private:
+	void CheckPredictionClock() {
+		if (!prediction_enabled_) { return; }
+		const int64_t clock_ns = get_clock()->now().nanoseconds();
+		if (prediction_last_clock_ns_ >= 0 && clock_ns < prediction_last_clock_ns_ - 1000LL) {
+			InvalidatePrediction("ROS_CLOCK_REWIND");
+		}
+		prediction_last_clock_ns_ = std::max(prediction_last_clock_ns_, clock_ns);
+	}
+
+	void InvalidatePrediction(const char* reason) {
+		if (!prediction_enabled_ || prediction_blocked_) { return; }
+		prediction_blocked_ = true;
+		++prediction_epoch_;
+		RCLCPP_ERROR(get_logger(), "Prediction invalidated: %s; recovery_requires_restart", reason);
+		PublishPredictionState();
+	}
+
+	void PublishPredictionState() {
+		if (!prediction_enabled_ || !prediction_pub_) { return; }
+		const double offset = (std::abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) ?
+			timediff_lidar_wrt_imu : -time_diff_lidar_to_imu;
+		const int64_t offset_ns = static_cast<int64_t>(std::llround(offset * 1e9));
+		if (prediction_have_valid_state_ && offset_ns != prediction_time_offset_ns_ && !prediction_blocked_) {
+			prediction_blocked_ = true;
+			++prediction_epoch_;
+			RCLCPP_ERROR(get_logger(), "Prediction IMU timebase changed; recovery_requires_restart");
+		}
+		prediction_time_offset_ns_ = offset_ns;
+		fastlio_prediction::Snapshot snapshot;
+		snapshot.session_id = prediction_session_;
+		snapshot.epoch = prediction_epoch_;
+		snapshot.sequence = ++prediction_snapshot_sequence_;
+		snapshot.correction_sequence = prediction_correction_sequence_;
+		snapshot.correction_stamp_ns = prediction_correction_stamp_ns_;
+		snapshot.imu_time_offset_ns = offset_ns;
+		snapshot.recovery_requires_restart = prediction_blocked_;
+		snapshot.initialized = p_imu->PredictionInitialized() &&
+			p_imu->PredictionStateTime() > 0. && !prediction_blocked_;
+		if (snapshot.initialized) {
+			snapshot.state = kf.get_x();
+			snapshot.covariance = kf.get_P();
+			snapshot.noise = p_imu->PredictionNoise();
+			snapshot.acceleration_scale = p_imu->PredictionAccelerationScale();
+			snapshot.stamp_ns = fastlio_prediction::stampNs(get_ros_time(p_imu->PredictionStateTime()));
+			const bool hold = ground_init_ && !ground_released_;
+			snapshot.phase = hold ? "GROUND_HOLD" :
+				(prediction_correction_sequence_ > 0 ? "LIDAR_TRACKING" : "RELEASED_IMU_ONLY");
+			if (!hold && prediction_release_stamp_ns_ == 0) {
+				prediction_release_stamp_ns_ = cloud_release_stamp_ > 0 ?
+					fastlio_prediction::stampNs(get_ros_time(cloud_release_stamp_)) : snapshot.stamp_ns;
+			}
+			snapshot.release_stamp_ns = prediction_release_stamp_ns_;
+			prediction_have_valid_state_ = true;
+		}
+		auto message = fastlio_prediction::encode(snapshot);
+		message.effective_measurement_count = static_cast<uint32_t>(std::max(0, effct_feat_num));
+		message.residual_mean_m = res_mean_last;
+		prediction_pub_->publish(message);
+	}
+
 	void ClearGroundBuffers()
 	{
 		imu_buffer.clear();
@@ -1158,6 +1242,7 @@ private:
 				cloud_release_stamp_ = ground_stamp_;
 				ground_phase_ = "IMU_READY_RELEASED";
 				StartupTrace::Get().Event("ground_release");
+				PublishPredictionState();
 				return;
 			}
 			ground_failed_ = ground_failed_ || (ground_state_ && ground_state_->armed);
@@ -1174,6 +1259,7 @@ private:
 			cloud_release_stamp_ = ground_stamp_;
 			ground_phase_ = "IMU_READY_RELEASED";
 			StartupTrace::Get().Event(std::string("ground_release,") + stationary_.reason);
+			PublishPredictionState();
 			return;
 		}
 		if (!ground_ready_ && stationary)
@@ -1196,6 +1282,7 @@ private:
 
     void timer_callback()
     {
+		CheckPredictionClock();
 		if (ground_init_)
 		{
 			const auto now = std::chrono::steady_clock::now();
@@ -1217,6 +1304,7 @@ private:
 					geoQuat.z = state_point.rot.coeffs()[2];
 					geoQuat.w = state_point.rot.coeffs()[3];
 					publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+					PublishPredictionState();
 				}
 			}
 			if (!ground_released_)
@@ -1264,6 +1352,7 @@ private:
 				if (Measures.lidar_beg_time < cloud_release_stamp_ + cloud_delay_seconds_)
 				{
 					trace_state("cloud_delayed");
+					PublishPredictionState();
 					return;
 				}
 				if (!cloud_delay_opened_)
@@ -1277,6 +1366,7 @@ private:
             {
 				trace_state("empty_scan");
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                PublishPredictionState();
                 return;
             }
 
@@ -1306,6 +1396,7 @@ private:
 					trace_state("map_created");
 					ground_phase_ = "MAP_READY";
                 }
+                PublishPredictionState();
                 return;
             }
             int featsFromMapNum = ikdtree.validnum();
@@ -1317,6 +1408,7 @@ private:
             if (feats_down_size < 5)
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                PublishPredictionState();
                 return;
             }
             
@@ -1359,6 +1451,11 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
+			if (prediction_enabled_ && effct_feat_num > 0 && !prediction_blocked_) {
+				prediction_correction_stamp_ns_ = fastlio_prediction::stampNs(get_ros_time(lidar_end_time));
+				++prediction_correction_sequence_;
+			}
+			PublishPredictionState();
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
@@ -1426,6 +1523,19 @@ private:
     }
 
 private:
+	bool prediction_enabled_ = false;
+	bool prediction_blocked_ = false;
+	bool prediction_have_valid_state_ = false;
+	std::string prediction_session_;
+	uint64_t prediction_epoch_ = 1;
+	uint64_t prediction_snapshot_sequence_ = 0;
+	uint64_t prediction_correction_sequence_ = 0;
+	int64_t prediction_correction_stamp_ns_ = 0;
+	int64_t prediction_release_stamp_ns_ = 0;
+	int64_t prediction_time_offset_ns_ = 0;
+	int64_t prediction_last_raw_imu_ns_ = -1;
+	int64_t prediction_last_clock_ns_ = -1;
+	rclcpp::Publisher<fast_lio::msg::FilterState>::SharedPtr prediction_pub_;
 	bool ground_init_ = false;
 	bool measured_bias_covariance_ = false;
 	bool ground_ready_ = false;

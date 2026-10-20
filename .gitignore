@@ -1,4 +1,7 @@
 build
+install/
+log/
+__pycache__/
 Log/*.png
 Log/*.txt
 Log/*.csv

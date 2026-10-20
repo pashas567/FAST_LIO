@@ -54,6 +54,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(mavros_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -69,6 +70,7 @@ set(dependencies
   geometry_msgs
   nav_msgs
   sensor_msgs
+  diagnostic_msgs
   mavros_msgs
   std_msgs
   std_srvs
@@ -87,10 +89,12 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
   "msg/Pose6D.msg"
+  "msg/FilterState.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  DEPENDENCIES std_msgs geometry_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -117,6 +121,14 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+add_executable(fastlio_imu_prediction src/imu_prediction_node.cpp)
+target_include_directories(fastlio_imu_prediction PRIVATE include)
+target_link_libraries(fastlio_imu_prediction Eigen3::Eigen ${cpp_typesupport_target})
+ament_target_dependencies(fastlio_imu_prediction rclcpp sensor_msgs nav_msgs diagnostic_msgs)
+if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)
+  rosidl_target_interfaces(fastlio_imu_prediction ${PROJECT_NAME} "rosidl_typesupport_cpp")
+endif()
+
 if(BUILD_TESTING)
   enable_testing()
   add_executable(startup_filter_test test/startup_filter_test.cpp)
@@ -124,10 +136,18 @@ if(BUILD_TESTING)
   target_link_libraries(startup_filter_test ${PCL_LIBRARIES} Eigen3::Eigen ${cpp_typesupport_target})
   ament_target_dependencies(startup_filter_test ${dependencies})
   add_test(NAME startup_filter_test COMMAND startup_filter_test)
+  add_executable(imu_prediction_test test/imu_prediction_test.cpp)
+  target_include_directories(imu_prediction_test PRIVATE include)
+  target_link_libraries(imu_prediction_test Eigen3::Eigen ${cpp_typesupport_target})
+  ament_target_dependencies(imu_prediction_test std_msgs geometry_msgs)
+  if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)
+    rosidl_target_interfaces(imu_prediction_test ${PROJECT_NAME} "rosidl_typesupport_cpp")
+  endif()
+  add_test(NAME imu_prediction_test COMMAND imu_prediction_test)
 endif()
 
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
+install(TARGETS fastlio_mapping fastlio_imu_prediction
   DESTINATION lib/${PROJECT_NAME}
 )
 
