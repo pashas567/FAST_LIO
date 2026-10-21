@@ -7,6 +7,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <memory>
 #include <nav_msgs/msg/odometry.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <string>
@@ -19,11 +20,15 @@ class ImuPredictionNode : public rclcpp::Node
   public:
 	ImuPredictionNode() : Node("fastlio_imu_prediction")
 	{
-		enabled_ = declare_parameter<bool>("prediction.enabled", false);
+		rcl_interfaces::msg::ParameterDescriptor startup_only;
+		startup_only.read_only = true;
+		startup_only.description = "Restart the predictor to change output ownership or rate";
+		enabled_ = declare_parameter<bool>("prediction.enabled", false, startup_only);
 		maximum_output_age_ns_ = secondsParameter("prediction.maximum_output_age_s", 0.05);
 		future_tolerance_ns_ = secondsParameter("prediction.future_tolerance_s", 0.001);
 		fp::Settings settings;
-		const double output_rate = declare_parameter<double>("prediction.output_rate_hz", 30.0);
+		const double output_rate =
+			declare_parameter<double>("prediction.output_rate_hz", 30.0, startup_only);
 		if (output_rate != 20.0 && output_rate != 30.0 && output_rate != 40.0)
 		{
 			throw std::invalid_argument("prediction.output_rate_hz must be 20.0, 30.0 or 40.0");

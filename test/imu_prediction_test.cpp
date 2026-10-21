@@ -375,6 +375,20 @@ void testSerializationAndCovarianceJacobians()
 		  "joint child-frame twist covariance Jacobian is wrong");
 }
 
+void testRetiredSessionAfterManyGroundResets()
+{
+	fp::Predictor core(settings());
+	const fp::Snapshot first = snapshot();
+	check(core.accept(first), "initial session rejected");
+	for (int index = 0; index < 32; ++index)
+	{
+		fp::Snapshot next = first;
+		next.session_id = "ground-reset-" + std::to_string(index);
+		check(core.accept(next), "new ground session rejected");
+	}
+	check(!core.accept(first), "old session revived after more than sixteen resets");
+}
+
 int main()
 {
 	try
@@ -383,6 +397,7 @@ int main()
 		testRatesAndScale();
 		testDelayedAndFutureCorrection();
 		testGapTimeoutEpochAndHold();
+		testRetiredSessionAfterManyGroundResets();
 		testSerializationAndCovarianceJacobians();
 		std::cout << "IMU prediction deterministic checks passed\n";
 	}

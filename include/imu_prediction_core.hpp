@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace fastlio_prediction
@@ -209,8 +210,7 @@ class Predictor
 	{
 		if (have_snapshot_ &&
 			((snapshot.session_id == anchor_.session_id && snapshot.epoch < anchor_.epoch) ||
-			 std::find(retired_sessions_.begin(), retired_sessions_.end(), snapshot.session_id) !=
-				 retired_sessions_.end()))
+			 retired_sessions_.find(snapshot.session_id) != retired_sessions_.end()))
 		{
 			++rejected_snapshots_;
 			return false;
@@ -264,11 +264,7 @@ class Predictor
 				history_.clear();
 				if (snapshot.session_id != anchor_.session_id)
 				{
-					retired_sessions_.push_back(anchor_.session_id);
-					if (retired_sessions_.size() > 16)
-					{
-						retired_sessions_.pop_front();
-					}
+					retired_sessions_.insert(anchor_.session_id);
 				}
 			}
 			last_published_ns_ = std::numeric_limits<int64_t>::min();
@@ -510,7 +506,7 @@ class Predictor
 	Snapshot anchor_;
 	std::deque<ImuSample, Eigen::aligned_allocator<ImuSample>> history_;
 	std::deque<Snapshot, Eigen::aligned_allocator<Snapshot>> pending_;
-	std::deque<std::string> retired_sessions_;
+	std::unordered_set<std::string> retired_sessions_;
 	int64_t current_stamp_ns_ = 0;
 	int64_t last_published_ns_ = std::numeric_limits<int64_t>::min();
 	int64_t largest_gap_ns_ = 0;
