@@ -357,8 +357,14 @@ class Predictor
 		{
 			return true;
 		}
-		const int64_t reference = anchor_.correction_stamp_ns > 0 ? anchor_.correction_stamp_ns
-																  : anchor_.release_stamp_ns;
+		// Manual takeoff deliberately postpones cloud corrections until height
+		// permission. Fresh mapper IMU-only snapshots remain usable in that
+		// phase; they never become fictitious LiDAR corrections. Once tracking
+		// starts, only the last actual correction can refresh this horizon.
+		const bool awaiting_first_correction = anchor_.phase == "RELEASED_IMU_ONLY" &&
+			anchor_.correction_sequence == 0 && anchor_.correction_stamp_ns == 0;
+		const int64_t reference = awaiting_first_correction ? anchor_.stamp_ns :
+			(anchor_.correction_stamp_ns > 0 ? anchor_.correction_stamp_ns : anchor_.release_stamp_ns);
 		return reference > 0 && stamp >= reference &&
 			   stamp - reference <= settings_.max_correction_age_ns;
 	}

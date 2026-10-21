@@ -290,6 +290,51 @@ void testGapTimeoutEpochAndHold()
 	check(held.back().state.vel.x() > 0.02, "release kept ground freeze active");
 }
 
+void testManualInertialSnapshotsBeforeFirstCorrection()
+{
+	fp::Predictor core{fp::Settings{}};
+	fp::Snapshot state = snapshot();
+	state.phase = "RELEASED_IMU_ONLY";
+	state.localization_phase = "INERTIAL_ONLY";
+	state.correction_sequence = 0;
+	state.correction_stamp_ns = 0;
+	Outputs outputs;
+	const auto publish = [&outputs](const fp::Output &value) { outputs.push_back(value); };
+	core.append(sample(state.stamp_ns), publish);
+	core.accept(state);
+	for (int index = 1; index <= 400; ++index)
+	{
+		core.append(sample(1000000000LL + index * 5000000LL), publish);
+		if (index % 20 == 0)
+		{
+			state.stamp_ns = 1000000000LL + index * 5000000LL;
+			++state.sequence;
+			core.accept(state);
+		}
+	}
+	check(outputs.size() >= 59, "pre-map prediction expired despite fresh inertial snapshots");
+	check(core.anchor().correction_sequence == 0 && core.anchor().correction_stamp_ns == 0,
+		  "inertial snapshots invented a LiDAR correction");
+	check(!core.validAt(state.stamp_ns + 500000001LL), "stale inertial snapshot remained valid");
+	state.phase = "LIDAR_TRACKING";
+	state.localization_phase = "MAP_READY";
+	state.correction_stamp_ns = state.stamp_ns;
+	state.correction_sequence = 1;
+	++state.sequence;
+	core.accept(state);
+	for (int index = 1; index <= 120; ++index)
+	{
+		core.append(sample(state.correction_stamp_ns + index * 5000000LL), publish);
+		if (index % 20 == 0)
+		{
+			state.stamp_ns = state.correction_stamp_ns + index * 5000000LL;
+			++state.sequence;
+			core.accept(state);
+		}
+	}
+	check(!core.validAt(state.stamp_ns), "uncorrected mapper states extended stale LiDAR tracking");
+}
+
 void testSerializationAndCovarianceJacobians()
 {
 	fp::Snapshot s = snapshot();
@@ -445,6 +490,7 @@ int main()
 		testRatesAndScale();
 		testDelayedAndFutureCorrection();
 		testGapTimeoutEpochAndHold();
+		testManualInertialSnapshotsBeforeFirstCorrection();
 		testRetiredSessionAfterManyGroundResets();
 		testUtcSnapshotTimeOrdering();
 		testCorrectionAtFinalImuGridPoint();
