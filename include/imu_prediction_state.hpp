@@ -7,6 +7,14 @@
 namespace fastlio_prediction
 {
 
+// Match the mapper's ROS header conversion. Multiplying a full UTC double by
+// 1e9 rounds at a different precision and can reverse equal event times.
+inline int64_t sourceTimeNs(double seconds)
+{
+	const int64_t whole = static_cast<int64_t>(std::floor(seconds));
+	return whole * 1000000000LL + static_cast<int64_t>((seconds - double(whole)) * 1e9);
+}
+
 inline int64_t stampNs(const builtin_interfaces::msg::Time &stamp)
 {
 	return int64_t(stamp.sec) * 1000000000LL + stamp.nanosec;

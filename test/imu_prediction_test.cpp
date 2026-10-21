@@ -389,6 +389,26 @@ void testRetiredSessionAfterManyGroundResets()
 	check(!core.accept(first), "old session revived after more than sixteen resets");
 }
 
+void testUtcSnapshotTimeOrdering()
+{
+	// These UTC fractions occur in the failed flight. The former full-double
+	// multiplication put equal correction times tens of nanoseconds ahead.
+	for (double utc : {1792592371.3995874, 1792592371.4995875, 1792592371.5995874})
+	{
+		fp::Snapshot original = snapshot(fp::sourceTimeNs(utc));
+		original.correction_stamp_ns = fp::sourceTimeNs(utc);
+		original.release_stamp_ns = fp::sourceTimeNs(utc - 1.0);
+		auto message = fp::encode(original);
+		fp::Snapshot decoded;
+		std::string error;
+		check(fp::decode(message, decoded, error), "equal UTC snapshot times were rejected");
+		check(decoded.correction_stamp_ns == decoded.stamp_ns,
+			  "identical correction and state times diverged during transport");
+		++message.last_correction_stamp_ns;
+		check(!fp::decode(message, decoded, error), "a genuinely future correction was accepted");
+	}
+}
+
 int main()
 {
 	try
@@ -398,6 +418,7 @@ int main()
 		testDelayedAndFutureCorrection();
 		testGapTimeoutEpochAndHold();
 		testRetiredSessionAfterManyGroundResets();
+		testUtcSnapshotTimeOrdering();
 		testSerializationAndCovarianceJacobians();
 		std::cout << "IMU prediction deterministic checks passed\n";
 	}

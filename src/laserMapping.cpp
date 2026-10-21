@@ -1293,8 +1293,13 @@ private:
         snapshot.epoch = prediction_epoch_;
         snapshot.sequence = ++prediction_sequence_;
         snapshot.correction_sequence = correction_sequence_;
-        snapshot.correction_stamp_ns = int64_t(std::llround(last_correction_time_ * 1e9));
-        snapshot.release_stamp_ns = int64_t(std::llround(cloud_release_stamp_ * 1e9));
+        // Use the same split seconds/nanoseconds conversion as the state stamp.
+        // Multiplying an absolute UTC double by 1e9 can put the correction
+        // tens of nanoseconds ahead of the identical state time.
+        snapshot.correction_stamp_ns =
+            fastlio_prediction::sourceTimeNs(last_correction_time_);
+        snapshot.release_stamp_ns =
+            fastlio_prediction::sourceTimeNs(cloud_release_stamp_);
         snapshot.imu_time_offset_ns = int64_t(std::llround(
             ((std::abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
                 ? timediff_lidar_wrt_imu : -time_diff_lidar_to_imu) * 1e9));
@@ -1317,7 +1322,7 @@ private:
             snapshot.covariance = kf.get_P();
             snapshot.noise = p_imu->PredictionNoise();
             snapshot.acceleration_scale = p_imu->PredictionAccelerationScale();
-            snapshot.stamp_ns = fastlio_prediction::stampNs(get_ros_time(p_imu->PredictionStateTime()));
+            snapshot.stamp_ns = fastlio_prediction::sourceTimeNs(p_imu->PredictionStateTime());
             const bool ground_hold = stationary_init_ && !init_released_;
             snapshot.phase = ground_hold ? "GROUND_HOLD" :
                 (correction_sequence_ > 0 ? "LIDAR_TRACKING" : "RELEASED_IMU_ONLY");
