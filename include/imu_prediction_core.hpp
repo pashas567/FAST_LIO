@@ -400,6 +400,20 @@ class Predictor
 	}
 
   private:
+	void emitPrediction(Filter &filter, const ImuSample &sample,
+						const std::function<void(const Output &)> &publish, bool hold)
+	{
+		Output out;
+		out.stamp_ns = sample.stamp_ns;
+		out.state = filter.get_x();
+		out.covariance = filter.get_P();
+		out.gyro = sample.gyro;
+		out.gyro_covariance = sample.gyro_covariance;
+		publish(out);
+		last_published_ns_ = sample.stamp_ns;
+		reason_ = hold ? "GROUND_HOLD" : "OK";
+	}
+
 	ImuSample corrected(const ImuSample &raw) const
 	{
 		ImuSample sample = raw;
@@ -428,6 +442,18 @@ class Predictor
 			const ImuSample original_tail = corrected(history_[i]);
 			if (original_tail.stamp_ns <= current_stamp_ns_)
 			{
+				// Applying a queued correction can leave its exact grid point at
+				// the last available IMU. Emit the corrected state now; waiting for
+				// another IMU adds latency and loses the final point at shutdown.
+				if (publish && original_tail.stamp_ns == current_stamp_ns_ &&
+					grid_.next() == current_stamp_ns_ && current_stamp_ns_ > last_published_ns_ &&
+					(current_stamp_ns_ < end_ns || (include_end && current_stamp_ns_ == end_ns)) &&
+					validAt(current_stamp_ns_))
+				{
+					emitPrediction(filter_, original_tail, *publish,
+								   anchor_.phase == "GROUND_HOLD");
+					grid_.advance();
+				}
 				continue;
 			}
 			if (current_stamp_ns_ >= end_ns)
@@ -472,15 +498,7 @@ class Predictor
 						propagate(partial, head, at_target, anchor_.noise,
 								  anchor_.acceleration_scale);
 					}
-					Output out;
-					out.stamp_ns = target;
-					out.state = partial.get_x();
-					out.covariance = partial.get_P();
-					out.gyro = at_target.gyro;
-					out.gyro_covariance = at_target.gyro_covariance;
-					(*publish)(out);
-					last_published_ns_ = target;
-					reason_ = hold ? "GROUND_HOLD" : "OK";
+					emitPrediction(partial, at_target, *publish, hold);
 				}
 				else if (!replaying_)
 				{

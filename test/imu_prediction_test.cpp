@@ -409,6 +409,34 @@ void testUtcSnapshotTimeOrdering()
 	}
 }
 
+void testCorrectionAtFinalImuGridPoint()
+{
+	for (int rate : {20, 30, 40})
+	{
+		fp::Predictor core(settings(rate));
+		const fp::Snapshot first = snapshot();
+		Outputs outputs;
+		const auto publish = [&outputs](const fp::Output &value) { outputs.push_back(value); };
+		core.append(sample(first.stamp_ns), publish);
+		core.accept(first);
+		for (int index = 1; index < 200; ++index)
+		{
+			core.append(sample(first.stamp_ns + index * 5000000LL), publish);
+		}
+		fp::Snapshot correction = first;
+		correction.stamp_ns += 1000000000LL;
+		correction.correction_stamp_ns = correction.stamp_ns;
+		correction.sequence = correction.correction_sequence = 2;
+		correction.state.pos.x() = 10.;
+		core.accept(correction);
+		core.append(sample(correction.stamp_ns), publish);
+		check(outputs.size() == size_t(rate), "final available corrected grid point was delayed");
+		check(outputs.back().stamp_ns == correction.stamp_ns, "final output needs another IMU");
+		check(std::abs(outputs.back().state.pos.x() - 10.) < 1e-12,
+			  "correction-boundary output used the old state");
+	}
+}
+
 int main()
 {
 	try
@@ -419,6 +447,7 @@ int main()
 		testGapTimeoutEpochAndHold();
 		testRetiredSessionAfterManyGroundResets();
 		testUtcSnapshotTimeOrdering();
+		testCorrectionAtFinalImuGridPoint();
 		testSerializationAndCovarianceJacobians();
 		std::cout << "IMU prediction deterministic checks passed\n";
 	}
