@@ -71,6 +71,7 @@
 #include <fast_lio/msg/cloud_control.hpp>
 #include <fast_lio/msg/session_odometry.hpp>
 #include <fast_lio/srv/reset_session.hpp>
+#include "imu_prediction_state.hpp"
 #include <fast_lio/msg/localization_status.hpp>
 #include <fast_lio/msg/initialization_control.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -772,7 +773,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br, bool publish_tf = true)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
@@ -800,7 +801,10 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    if (publish_tf)
+    {
+        tf_br->sendTransform(trans);
+    }
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -1130,6 +1134,15 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
+        prediction_enabled_ = declare_parameter<bool>("prediction.enabled", false);
+        prediction_process_session_ = std::to_string(getpid()) + "-" +
+            std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        if (prediction_enabled_)
+        {
+            prediction_pub_ = create_publisher<fast_lio::msg::FilterState>(
+                "/lio/filter_state", rclcpp::QoS(20).reliable().transient_local());
+        }
+
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
@@ -1144,6 +1157,7 @@ public:
 			imu_topic, rclcpp::QoS(imu_queue_depth).reliable(),
 			[this](sensor_msgs::msg::Imu::UniquePtr message)
 			{
+                CheckPredictionClock(message->header.stamp);
 				imu_cbk(std::move(message));
 				ObserveStationaryImu();
 			});
@@ -1248,9 +1262,77 @@ public:
 	}
 
 private:
+    void CheckPredictionClock(const builtin_interfaces::msg::Time& stamp)
+    {
+        if (!prediction_enabled_ || prediction_blocked_)
+        {
+            return;
+        }
+        const int64_t source_ns = fastlio_prediction::stampNs(stamp);
+        const int64_t clock_ns = get_clock()->now().nanoseconds();
+        if ((prediction_last_imu_ns_ >= 0 && source_ns < prediction_last_imu_ns_)
+            || (prediction_last_clock_ns_ >= 0 && clock_ns + 1000 < prediction_last_clock_ns_))
+        {
+            prediction_blocked_ = true;
+            ++prediction_epoch_;
+            RCLCPP_ERROR(get_logger(), "Prediction time rewind; restart or authorized ground reset required");
+            PublishPredictionState();
+        }
+        prediction_last_imu_ns_ = std::max(prediction_last_imu_ns_, source_ns);
+        prediction_last_clock_ns_ = std::max(prediction_last_clock_ns_, clock_ns);
+    }
+
+    void PublishPredictionState()
+    {
+        if (!prediction_pub_)
+        {
+            return;
+        }
+        fastlio_prediction::Snapshot snapshot;
+        snapshot.session_id = session_id_.empty() ? prediction_process_session_ : session_id_;
+        snapshot.epoch = prediction_epoch_;
+        snapshot.sequence = ++prediction_sequence_;
+        snapshot.correction_sequence = correction_sequence_;
+        snapshot.correction_stamp_ns = int64_t(std::llround(last_correction_time_ * 1e9));
+        snapshot.release_stamp_ns = int64_t(std::llround(cloud_release_stamp_ * 1e9));
+        snapshot.imu_time_offset_ns = int64_t(std::llround(
+            ((std::abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
+                ? timediff_lidar_wrt_imu : -time_diff_lidar_to_imu) * 1e9));
+        if (prediction_have_state_ && snapshot.imu_time_offset_ns != prediction_offset_ns_)
+        {
+            prediction_blocked_ = true;
+            ++prediction_epoch_;
+            snapshot.epoch = prediction_epoch_;
+            RCLCPP_ERROR(get_logger(), "Prediction timebase changed; restart or ground reset required");
+        }
+        prediction_offset_ns_ = snapshot.imu_time_offset_ns;
+        snapshot.recovery_requires_restart = prediction_blocked_;
+        snapshot.localization_phase = init_phase_;
+        snapshot.gyro_bias_frozen = get_parameter("startup.freeze_gyro_bias").as_bool();
+        snapshot.initialized = p_imu->PredictionInitialized()
+            && p_imu->PredictionStateTime() > 0.0 && !prediction_blocked_ && !init_failed_;
+        if (snapshot.initialized)
+        {
+            snapshot.state = kf.get_x();
+            snapshot.covariance = kf.get_P();
+            snapshot.noise = p_imu->PredictionNoise();
+            snapshot.acceleration_scale = p_imu->PredictionAccelerationScale();
+            snapshot.stamp_ns = fastlio_prediction::stampNs(get_ros_time(p_imu->PredictionStateTime()));
+            const bool ground_hold = stationary_init_ && !init_released_;
+            snapshot.phase = ground_hold ? "GROUND_HOLD" :
+                (correction_sequence_ > 0 ? "LIDAR_TRACKING" : "RELEASED_IMU_ONLY");
+            prediction_have_state_ = true;
+        }
+        auto message = fastlio_prediction::encode(snapshot);
+        message.effective_measurement_count = static_cast<uint32_t>(std::max(0, effct_feat_num));
+        message.residual_mean_m = res_mean_last;
+        prediction_pub_->publish(message);
+    }
+
     void PublishSessionOdometry()
     {
-        publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+        PublishPredictionState();
+        publish_odometry(pubOdomAftMapped_, tf_broadcaster_, !prediction_enabled_);
         fast_lio::msg::SessionOdometry message;
         message.session_id = session_id_;
         message.phase = init_phase_;
@@ -1284,6 +1366,10 @@ private:
         ResetScanState();
         session_id_ = request.session_id;
         cloud_permission_.BindSession(session_id_);
+        prediction_blocked_ = false;
+        prediction_last_clock_ns_ = prediction_last_imu_ns_ = -1;
+        ++prediction_epoch_;
+        PublishPredictionState();
         response.success = true;
         response.message = session_id_;
         RCLCPP_INFO(get_logger(), "Localization session reset: %s", session_id_.c_str());
@@ -1309,6 +1395,7 @@ private:
         init_ready_ = init_released_ = init_failed_ = ground_retry_pending_ = false;
         init_stamp_ = cloud_release_stamp_ = 0.0;
         cloud_delay_opened_ = false;
+        prediction_have_state_ = false;
         correction_sequence_ = 0;
         last_correction_time_ = 0.0;
         init_phase_ = "COLLECTING_NEW_SESSION";
@@ -1491,6 +1578,7 @@ private:
         msg.effective_points = effct_feat_num;
         msg.mean_residual_m = res_mean_last;
         msg.translation_condition_ratio = translation_condition_ratio;
+        PublishPredictionState();
         localization_status_pub_->publish(msg);
     }
 
@@ -1774,6 +1862,16 @@ private:
     }
 
 private:
+    bool prediction_enabled_ = false;
+    bool prediction_blocked_ = false;
+    bool prediction_have_state_ = false;
+    std::string prediction_process_session_;
+    uint64_t prediction_epoch_ = 1;
+    uint64_t prediction_sequence_ = 0;
+    int64_t prediction_last_clock_ns_ = -1;
+    int64_t prediction_last_imu_ns_ = -1;
+    int64_t prediction_offset_ns_ = 0;
+    rclcpp::Publisher<fast_lio::msg::FilterState>::SharedPtr prediction_pub_;
     std::string session_id_, control_session_;
     int64_t control_stamp_ns_ = 0;
     bool synchronous_map_rebuild_ = false;

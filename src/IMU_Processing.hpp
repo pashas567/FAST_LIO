@@ -53,6 +53,20 @@ class ImuProcess
 		esekfom::esekf<state_ikfom, 12, input_ikfom>& filter, bool measured_bias_covariance = false);
 	void AdvanceStationary(const sensor_msgs::msg::Imu::ConstSharedPtr& sample);
 
+  // Source state time and the exact normalization/noise used by mapper.
+  bool PredictionInitialized() const { return !imu_need_init_; }
+  double PredictionStateTime() const { return last_lidar_end_time_; }
+  double PredictionAccelerationScale() const { return G_m_s2 / mean_acc.norm(); }
+  Eigen::Matrix<double, 12, 12> PredictionNoise() const
+  {
+    Eigen::Matrix<double, 12, 12> noise = Eigen::Matrix<double, 12, 12>::Zero();
+    noise.block<3, 3>(0, 0).diagonal() = cov_gyr;
+    noise.block<3, 3>(3, 3).diagonal() = cov_acc;
+    noise.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+    noise.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+    return noise;
+  }
+
   ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;

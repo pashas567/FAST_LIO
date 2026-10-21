@@ -51,6 +51,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -80,6 +81,7 @@ message(Eigen: ${EIGEN3_INCLUDE_DIR})
 message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
+  "msg/FilterState.msg"
   "msg/Pose6D.msg"
   "msg/InitializationControl.msg"
   "msg/CloudControl.msg"
@@ -90,7 +92,7 @@ set(msg_files
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
-  DEPENDENCIES std_msgs nav_msgs
+  DEPENDENCIES std_msgs nav_msgs geometry_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -117,7 +119,20 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+add_executable(fastlio_stream_probe src/stream_timing_node.cpp)
+ament_target_dependencies(fastlio_stream_probe rclcpp sensor_msgs nav_msgs geometry_msgs livox_interfaces)
+
+add_executable(fastlio_imu_prediction src/imu_prediction_node.cpp)
+target_include_directories(fastlio_imu_prediction PRIVATE include)
+target_link_libraries(fastlio_imu_prediction Eigen3::Eigen ${cpp_typesupport_target})
+ament_target_dependencies(fastlio_imu_prediction rclcpp sensor_msgs nav_msgs geometry_msgs diagnostic_msgs tf2_ros)
+
 if(BUILD_TESTING)
+  add_executable(imu_prediction_test test/imu_prediction_test.cpp)
+  target_include_directories(imu_prediction_test PRIVATE include)
+  target_link_libraries(imu_prediction_test Eigen3::Eigen ${cpp_typesupport_target})
+  ament_target_dependencies(imu_prediction_test std_msgs geometry_msgs)
+  add_test(NAME imu_prediction_test COMMAND imu_prediction_test)
   enable_testing()
   add_executable(startup_filter_test test/startup_filter_test.cpp)
   target_include_directories(startup_filter_test PRIVATE include src ${PCL_INCLUDE_DIRS})
@@ -131,7 +146,7 @@ if(BUILD_TESTING)
 endif()
 
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
+install(TARGETS fastlio_mapping fastlio_imu_prediction fastlio_stream_probe
   DESTINATION lib/${PROJECT_NAME}
 )
 
