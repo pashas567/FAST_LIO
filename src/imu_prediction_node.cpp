@@ -143,6 +143,8 @@ class ImuPredictionNode : public rclcpp::Node
 				pending_selected_.clear();
 				latest_output_ns_ = 0;
 				latest_selected_ns_ = 0;
+				selected_publication_clock_ns_ = 0;
+				selected_publication_steady_ns_ = 0;
 				last_output_rejection_.clear();
 				last_raw_imu_ns_ = 0;
 				time_failure_ = false;
@@ -294,7 +296,8 @@ class ImuPredictionNode : public rclcpp::Node
 	void publishSelected(nav_msgs::msg::Odometry message)
 	{
 		const int64_t stamp = fp::stampNs(message.header.stamp);
-		const int64_t age = get_clock()->now().nanoseconds() - stamp;
+		const int64_t now_ns = get_clock()->now().nanoseconds();
+		const int64_t age = now_ns - stamp;
 		if (age < -future_tolerance_ns_ || age > maximum_output_age_ns_)
 		{
 			++rejected_output_age_;
@@ -302,6 +305,10 @@ class ImuPredictionNode : public rclcpp::Node
 			return;
 		}
 		latest_selected_ns_ = stamp;
+		selected_publication_clock_ns_ = now_ns;
+		selected_publication_steady_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+											  std::chrono::steady_clock::now().time_since_epoch())
+											  .count();
 		last_output_rejection_.clear();
 		message.child_frame_id = "body";
 		selected_output_->publish(message);
@@ -318,6 +325,8 @@ class ImuPredictionNode : public rclcpp::Node
 		transform.transform.translation.z = message.pose.pose.position.z;
 		transform.transform.rotation = message.pose.pose.orientation;
 		transforms_->sendTransform(transform);
+		// Every selected pose has a checkpoint, including timer-released poses.
+		publishStatus();
 	}
 
 	void publishStatus()
@@ -381,6 +390,8 @@ class ImuPredictionNode : public rclcpp::Node
 		add("epoch", std::to_string(anchor.epoch));
 		add("source_stamp_ns", std::to_string(source));
 		add("selected_output_stamp_ns", std::to_string(latest_selected_ns_));
+		add("selected_publication_clock_ns", std::to_string(selected_publication_clock_ns_));
+		add("selected_publication_steady_ns", std::to_string(selected_publication_steady_ns_));
 		add("output_stamp_ns", std::to_string(latest_output_ns_));
 		add("last_correction_stamp_ns", std::to_string(anchor.correction_stamp_ns));
 		add("correction_sequence", std::to_string(anchor.correction_sequence));
@@ -404,6 +415,8 @@ class ImuPredictionNode : public rclcpp::Node
 	std::unique_ptr<tf2_ros::TransformBroadcaster> transforms_;
 	int64_t maximum_output_age_ns_ = 50000000LL;
 	int64_t minimum_output_age_ns_ = 3000000LL;
+	int64_t selected_publication_clock_ns_ = 0;
+	int64_t selected_publication_steady_ns_ = 0;
 	int64_t future_tolerance_ns_ = 1000000LL;
 	int64_t last_raw_imu_ns_ = 0;
 	uint64_t rejected_output_age_ = 0;
