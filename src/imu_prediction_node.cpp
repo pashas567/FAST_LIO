@@ -1,5 +1,6 @@
 #include "imu_prediction_state.hpp"
 #include <chrono>
+#include <deque>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
@@ -25,7 +26,12 @@ class ImuPredictionNode : public rclcpp::Node
 		startup_only.description = "Restart the predictor to change output ownership or rate";
 		enabled_ = declare_parameter<bool>("prediction.enabled", false, startup_only);
 		maximum_output_age_ns_ = secondsParameter("prediction.maximum_output_age_s", 0.05);
+		minimum_output_age_ns_ = secondsParameter("prediction.minimum_output_age_s", 0.003);
 		future_tolerance_ns_ = secondsParameter("prediction.future_tolerance_s", 0.001);
+		if (minimum_output_age_ns_ >= maximum_output_age_ns_)
+		{
+			throw std::invalid_argument("minimum output age must be less than maximum output age");
+		}
 		fp::Settings settings;
 		const double output_rate =
 			declare_parameter<double>("prediction.output_rate_hz", 30.0, startup_only);
@@ -83,6 +89,8 @@ class ImuPredictionNode : public rclcpp::Node
 			imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
 				input, rclcpp::SensorDataQoS().keep_last(400),
 				[this](sensor_msgs::msg::Imu::ConstSharedPtr msg) { onImu(*msg); });
+			publication_timer_ =
+				create_wall_timer(std::chrono::milliseconds(1), [this]() { flushSelected(); });
 		}
 		watchdog_ =
 			create_wall_timer(std::chrono::milliseconds(100), [this]() { publishStatus(); });
@@ -93,6 +101,14 @@ class ImuPredictionNode : public rclcpp::Node
 	}
 
   private:
+	struct PendingSelected
+	{
+		nav_msgs::msg::Odometry message;
+		std::string session_id;
+		std::string phase;
+		uint64_t epoch;
+	};
+
 	int64_t secondsParameter(const std::string &name, double initial)
 	{
 		const double value = declare_parameter<double>(name, initial);
@@ -124,6 +140,7 @@ class ImuPredictionNode : public rclcpp::Node
 			state_error_.clear();
 			if (new_epoch)
 			{
+				pending_selected_.clear();
 				latest_output_ns_ = 0;
 				latest_selected_ns_ = 0;
 				last_output_rejection_.clear();
@@ -218,8 +235,60 @@ class ImuPredictionNode : public rclcpp::Node
 		}
 		latest_output_ns_ = out.stamp_ns;
 		output_->publish(message);
-		publishSelected(message);
+		const auto &anchor = predictor_->anchor();
+		pending_selected_.push_back(
+			{std::move(message), anchor.session_id, anchor.localization_phase, anchor.epoch});
+		// Bound the queue by source time even if /clock stops while IMU keeps
+		// arriving. These already computed poses never extrapolate beyond IMU.
+		while (!pending_selected_.empty() &&
+			   out.stamp_ns - fp::stampNs(pending_selected_.front().message.header.stamp) >
+				   maximum_output_age_ns_)
+		{
+			pending_selected_.pop_front();
+			++rejected_output_age_;
+			last_output_rejection_ = "OUTPUT_CLOCK_LAG";
+		}
+		flushSelected();
 		publishStatus();
+	}
+
+	void flushSelected()
+	{
+		if (pending_selected_.empty())
+		{
+			return;
+		}
+		const int64_t receipt_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+										std::chrono::steady_clock::now() - last_imu_receipt_)
+										.count();
+		if (bad_snapshot_ || numeric_failure_ || time_failure_ || !have_imu_ ||
+			receipt_age > imu_timeout_ns_ || !predictor_->validAt(predictor_->latestSourceStamp()))
+		{
+			pending_selected_.clear();
+			return;
+		}
+		const auto &anchor = predictor_->anchor();
+		while (!pending_selected_.empty())
+		{
+			const auto &pending = pending_selected_.front();
+			if (pending.session_id != anchor.session_id || pending.epoch != anchor.epoch ||
+				pending.phase != anchor.localization_phase)
+			{
+				pending_selected_.pop_front();
+				continue;
+			}
+			const int64_t age =
+				get_clock()->now().nanoseconds() - fp::stampNs(pending.message.header.stamp);
+			if (age < minimum_output_age_ns_)
+			{
+				return;
+			}
+			// Only publication waits for clock delivery. Integration and the raw
+			// stream keep their source-time cadence and original timestamps.
+			nav_msgs::msg::Odometry message = std::move(pending_selected_.front().message);
+			pending_selected_.pop_front();
+			publishSelected(std::move(message));
+		}
 	}
 
 	void publishSelected(nav_msgs::msg::Odometry message)
@@ -307,6 +376,7 @@ class ImuPredictionNode : public rclcpp::Node
 		add("phase", anchor.phase);
 		add("localization_phase", anchor.localization_phase);
 		add("rejected_output_age", std::to_string(rejected_output_age_));
+		add("pending_selected_outputs", std::to_string(pending_selected_.size()));
 		add("session_id", anchor.session_id);
 		add("epoch", std::to_string(anchor.epoch));
 		add("source_stamp_ns", std::to_string(source));
@@ -333,6 +403,7 @@ class ImuPredictionNode : public rclcpp::Node
 	rclcpp::Publisher<fast_lio::msg::SessionOdometry>::SharedPtr session_output_;
 	std::unique_ptr<tf2_ros::TransformBroadcaster> transforms_;
 	int64_t maximum_output_age_ns_ = 50000000LL;
+	int64_t minimum_output_age_ns_ = 3000000LL;
 	int64_t future_tolerance_ns_ = 1000000LL;
 	int64_t last_raw_imu_ns_ = 0;
 	uint64_t rejected_output_age_ = 0;
@@ -354,6 +425,8 @@ class ImuPredictionNode : public rclcpp::Node
 	rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 	rclcpp::Subscription<fast_lio::msg::FilterState>::SharedPtr state_sub_;
 	rclcpp::TimerBase::SharedPtr watchdog_;
+	rclcpp::TimerBase::SharedPtr publication_timer_;
+	std::deque<PendingSelected> pending_selected_;
 };
 
 int main(int argc, char **argv)
